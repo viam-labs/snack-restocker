@@ -1,0 +1,13 @@
+{
+  "module_name": "snack-restocker",
+  "visibility": "public",
+  "namespace": "viam",
+  "language": "go",
+  "resource_type": "service",
+  "resource_subtype": "generic",
+  "model_name": "restocker",
+  "initialize_git": false,
+  "generator_version": "0.1.0",
+  "generated_on": "2026-10-28T18:22:23.813716Z",
+  "module_readme_link": "README.md"
+}
