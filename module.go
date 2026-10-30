@@ -26,7 +26,7 @@ const (
 )
 
 // Pause after each move / gripper command.
-const stepDelay = time.Second
+var stepDelay = time.Second
 
 // erh:vmodutils:arm-position-saver switches: SetPosition(1) records a pose,
 // SetPosition(2) goes to the saved pose.
@@ -125,9 +125,10 @@ func init() {
 type Config struct{}
 
 // Validate requires the gripper and every pose-saver switch used by the
-// restock sequence.
+// restock sequence. The fixture-teacher drawer services are optional; only
+// restock_fixture uses them.
 func (cfg Config) Validate(path string) ([]string, []string, error) {
-	return append([]string{gripperName}, allSwitches()...), nil, nil
+	return append([]string{gripperName}, allSwitches()...), []string{drawerOpenerName, drawerCloserName}, nil
 }
 
 // allSwitches lists every pose-saver switch used by the restock sequence.
@@ -149,6 +150,11 @@ type snackRestockerRestocker struct {
 
 	gripper  gripper.Gripper
 	switches map[string]toggleswitch.Switch
+
+	// Optional fixture-teacher services; nil when not on the machine. Used
+	// only by restock_fixture.
+	drawerOpener resource.Resource
+	drawerCloser resource.Resource
 
 	mu    sync.Mutex
 	state State
@@ -181,17 +187,30 @@ func NewRestocker(ctx context.Context, deps resource.Dependencies, name resource
 		switches[n] = sw
 	}
 
+	drawerOpener, err := generic.FromProvider(deps, drawerOpenerName)
+	if err != nil {
+		logger.Infof("%s not available, restock_fixture disabled: %v", drawerOpenerName, err)
+		drawerOpener = nil
+	}
+	drawerCloser, err := generic.FromProvider(deps, drawerCloserName)
+	if err != nil {
+		logger.Infof("%s not available, restock_fixture disabled: %v", drawerCloserName, err)
+		drawerCloser = nil
+	}
+
 	cancelCtx, cancelFunc := context.WithCancel(context.Background())
 
 	s := &snackRestockerRestocker{
-		name:       name,
-		logger:     logger,
-		cfg:        conf,
-		gripper:    g,
-		switches:   switches,
-		state:      initialState,
-		cancelCtx:  cancelCtx,
-		cancelFunc: cancelFunc,
+		name:         name,
+		logger:       logger,
+		cfg:          conf,
+		gripper:      g,
+		switches:     switches,
+		drawerOpener: drawerOpener,
+		drawerCloser: drawerCloser,
+		state:        initialState,
+		cancelCtx:    cancelCtx,
+		cancelFunc:   cancelFunc,
 	}
 	return s, nil
 }
@@ -366,44 +385,7 @@ func (s *snackRestockerRestocker) runRestock(ctx context.Context) (map[string]in
 		}
 	}
 
-	// --- picking_up_snack -----------------------------------------
-	if err := s.transition(statePickingUpSnack, false); err != nil {
-		return nil, err
-	}
-	// restock-1-find, then open the gripper to prepare for the snack.
-	if err := s.goToPose(ctx, "restock-1-find", next(), &steps); err != nil {
-		return nil, err
-	}
-	if err := s.setGripper(ctx, gripperOpen, next(), &steps); err != nil {
-		return nil, err
-	}
-	// restock-2-reach-snack, then grab the snack.
-	if err := s.goToPose(ctx, "restock-2-reach-snack", next(), &steps); err != nil {
-		return nil, err
-	}
-	if err := s.setGripper(ctx, gripperClose, next(), &steps); err != nil {
-		return nil, err
-	}
-	// restock-3-lift-snack: lift the snack clear.
-	if err := s.goToPose(ctx, "restock-3-lift-snack", next(), &steps); err != nil {
-		return nil, err
-	}
-
-	// --- restocking -----------------------------------------------
-	if err := s.transition(stateRestocking, false); err != nil {
-		return nil, err
-	}
-	for _, name := range []string{"restock-4-view-drawer", "restock-5-drop"} {
-		if err := s.goToPose(ctx, name, next(), &steps); err != nil {
-			return nil, err
-		}
-	}
-	// restocking ends once the gripper opens to release the snack.
-	if err := s.setGripper(ctx, gripperOpen, next(), &steps); err != nil {
-		return nil, err
-	}
-	// Close the gripper fully so the arm pushes the drawer shut.
-	if err := s.setGripper(ctx, gripperFullClose, next(), &steps); err != nil {
+	if err := s.pickAndDrop(ctx, next, &steps); err != nil {
 		return nil, err
 	}
 
@@ -438,6 +420,53 @@ func (s *snackRestockerRestocker) runRestock(ctx context.Context) (map[string]in
 	}, nil
 }
 
+// pickAndDrop runs picking_up_snack and restocking: grab the snack from the
+// saved restock poses, drop it in the open drawer, then close the gripper
+// fully so the arm can push the drawer shut.
+func (s *snackRestockerRestocker) pickAndDrop(ctx context.Context, next func() int, steps *[]interface{}) error {
+	// --- picking_up_snack -----------------------------------------
+	if err := s.transition(statePickingUpSnack, false); err != nil {
+		return err
+	}
+	// restock-1-find, then open the gripper to prepare for the snack.
+	if err := s.goToPose(ctx, "restock-1-find", next(), steps); err != nil {
+		return err
+	}
+	if err := s.setGripper(ctx, gripperOpen, next(), steps); err != nil {
+		return err
+	}
+	// restock-2-reach-snack, then grab the snack.
+	if err := s.goToPose(ctx, "restock-2-reach-snack", next(), steps); err != nil {
+		return err
+	}
+	if err := s.setGripper(ctx, gripperClose, next(), steps); err != nil {
+		return err
+	}
+	// restock-3-lift-snack: lift the snack clear.
+	if err := s.goToPose(ctx, "restock-3-lift-snack", next(), steps); err != nil {
+		return err
+	}
+
+	// --- restocking -----------------------------------------------
+	if err := s.transition(stateRestocking, false); err != nil {
+		return err
+	}
+	for _, name := range []string{"restock-4-view-drawer", "restock-5-drop"} {
+		if err := s.goToPose(ctx, name, next(), steps); err != nil {
+			return err
+		}
+	}
+	// restocking ends once the gripper opens to release the snack.
+	if err := s.setGripper(ctx, gripperOpen, next(), steps); err != nil {
+		return err
+	}
+	// Close the gripper fully so the arm pushes the drawer shut.
+	if err := s.setGripper(ctx, gripperFullClose, next(), steps); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (s *snackRestockerRestocker) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	if restock, _ := cmd["restock"].(bool); restock {
 		result, err := s.runRestock(ctx)
@@ -448,6 +477,20 @@ func (s *snackRestockerRestocker) DoCommand(ctx context.Context, cmd map[string]
 				"restock": "failed",
 				"error":   err.Error(),
 				"state":   string(s.currentState()),
+			}, nil
+		}
+		return result, nil
+	}
+
+	if fixture, _ := cmd["restock_fixture"].(bool); fixture {
+		result, err := s.runFixtureRestock(ctx)
+		if err != nil {
+			s.logger.Errorf("fixture restock sequence failed: %v", err)
+			_ = s.transition(initialState, true)
+			return map[string]interface{}{
+				"restock_fixture": "failed",
+				"error":           err.Error(),
+				"state":           string(s.currentState()),
 			}, nil
 		}
 		return result, nil
@@ -497,11 +540,12 @@ func (s *snackRestockerRestocker) DoCommand(ctx context.Context, cmd map[string]
 	return map[string]interface{}{
 		"error": fmt.Sprintf("unknown command: %v", keys),
 		"usage": `send {"restock": true} to run the restock sequence, ` +
+			`{"restock_fixture": true} to run it with the drawer-open and draw-closer services, ` +
 			`{"get_state": true} to read the state machine, ` +
 			`{"advance_state": true} to step to the next state, ` +
 			`{"set_state": "<state>", "force": false} to set a state, ` +
 			`or {"reset_state": true} to return to idle`,
-		"supported_commands": []interface{}{"restock", "get_state", "advance_state", "set_state", "reset_state"},
+		"supported_commands": []interface{}{"restock", "restock_fixture", "get_state", "advance_state", "set_state", "reset_state"},
 		"states":             stateStrings(stateSequence),
 		"state":              string(s.currentState()),
 	}, nil
