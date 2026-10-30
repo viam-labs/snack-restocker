@@ -75,15 +75,20 @@ func newPickRig(t *testing.T, sam3Resp map[string]interface{}) *pickRig {
 }
 
 // Two bags, best first, as the sam3-segments DoCommand returns them.
+func segment(conf float64, center, dims r3.Vector) map[string]interface{} {
+	return map[string]interface{}{
+		"label":           "snack bag",
+		"confidence":      conf,
+		"reference_frame": "world",
+		"center_mm":       vec(center),
+		"dims_mm":         vec(dims),
+		"max_mm":          vec(center.Add(dims.Mul(0.5))),
+	}
+}
+
 func twoBags() map[string]interface{} {
 	bag := func(conf, x, topZ float64) map[string]interface{} {
-		return map[string]interface{}{
-			"label":           "snack bag",
-			"confidence":      conf,
-			"reference_frame": "world",
-			"center_mm":       map[string]interface{}{"x": x, "y": -440.0, "z": topZ - 30},
-			"max_mm":          map[string]interface{}{"x": x + 50, "y": -400.0, "z": topZ},
-		}
+		return segment(conf, r3.Vector{X: x, Y: -440, Z: topZ - 30}, r3.Vector{X: 100, Y: 80, Z: 60})
 	}
 	return map[string]interface{}{"objects": []interface{}{bag(0.9, 250, 100), bag(0.6, 150, 90)}}
 }
@@ -173,5 +178,36 @@ func TestPickSnackWithoutServices(t *testing.T) {
 	resp, _ := s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
 	if resp["pick_snack"] != "failed" {
 		t.Fatalf("missing services: %v", resp)
+	}
+}
+
+// Segments seen on munch-monitor: bag-sized clouds a meter outside the bin,
+// stretched clouds from far depth readings, and tiny fragments.
+func TestPickSnackSkipsImplausibleSegments(t *testing.T) {
+	outsideBin := segment(0.93, r3.Vector{X: 357, Y: -1539, Z: -887}, r3.Vector{X: 360, Y: 245, Z: 152})
+	stretched := segment(0.93, r3.Vector{X: 347, Y: -440, Z: 100}, r3.Vector{X: 388, Y: 300, Z: 1409})
+	fragment := segment(0.92, r3.Vector{X: 399, Y: -297, Z: 57}, r3.Vector{X: 6, Y: 7, Z: 4})
+	realBag := segment(0.90, r3.Vector{X: 121, Y: -419, Z: 181}, r3.Vector{X: 140, Y: 202, Z: 165})
+	rig := newPickRig(t, map[string]interface{}{
+		"objects": []interface{}{outsideBin, stretched, fragment, realBag},
+	})
+	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true, "dry_run": true})
+	if resp["pick_snack"] != "planned" {
+		t.Fatalf("dry run: %v", resp)
+	}
+	if resp["confidence"] != 0.90 || resp["rejected"] != 3 || resp["candidates"] != 4 {
+		t.Fatalf("should skip 3 bad segments and pick the real bag: %v", resp)
+	}
+	if c := resp["center_mm"].(map[string]interface{}); c["x"] != 121.0 || c["y"] != -419.0 {
+		t.Fatalf("center: %v", c)
+	}
+}
+
+func TestPickSnackFailsWhenNoSegmentIsPlausible(t *testing.T) {
+	outsideBin := segment(0.93, r3.Vector{X: 357, Y: -1539, Z: -887}, r3.Vector{X: 360, Y: 245, Z: 152})
+	rig := newPickRig(t, map[string]interface{}{"objects": []interface{}{outsideBin}})
+	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
+	if resp["pick_snack"] != "failed" || len(rig.moves) != 0 || len(rig.grips) != 0 {
+		t.Fatalf("should fail without moving toward the bag: %v moves=%v grips=%v", resp, rig.moves, rig.grips)
 	}
 }

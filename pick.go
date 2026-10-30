@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/golang/geo/r3"
 	"go.viam.com/rdk/motionplan"
@@ -34,6 +35,22 @@ const (
 	defaultGraspDepthMm = 20.0  // how far below the top of the bag to close
 )
 
+// Where a real snack bag can be: inside the footprint of the "bin" obstacle
+// (centered at (250, -439), 555 x 355 mm) and between the table and the top
+// of the bin. Segments outside it come from bad depth readings, such as
+// far-away background pixels in a mask.
+var (
+	binMin = r3.Vector{X: 250 - 555.0/2, Y: -439 - 355.0/2, Z: -50}
+	binMax = r3.Vector{X: 250 + 555.0/2, Y: -439 + 355.0/2, Z: 450}
+)
+
+// Largest side of a plausible snack bag, in mm. Smaller segments are
+// fragments; larger ones include points that are not on the bag.
+const (
+	minBagSizeMm = 40.0
+	maxBagSizeMm = 400.0
+)
+
 // Straight-line tolerance for the descend and lift moves.
 var straightDown = &motionplan.Constraints{
 	LinearConstraint: []motionplan.LinearConstraint{{LineToleranceMm: 10, OrientationToleranceDegs: 5}},
@@ -46,6 +63,7 @@ type snackTarget struct {
 	center     r3.Vector
 	topZ       float64
 	candidates int
+	rejected   int
 }
 
 // topDown is the tool pointing straight down (-Z in world).
@@ -59,7 +77,7 @@ func vec(v r3.Vector) map[string]interface{} {
 }
 
 // findSnack asks sam3-vision for segments (sorted best-first) and returns the
-// first one.
+// first one that could be a real bag in the bin.
 func (s *snackRestockerRestocker) findSnack(ctx context.Context) (*snackTarget, error) {
 	resp, err := s.vision.DoCommand(ctx, map[string]interface{}{"command": "get_object_point_clouds"})
 	if err != nil {
@@ -72,29 +90,58 @@ func (s *snackRestockerRestocker) findSnack(ctx context.Context) (*snackTarget, 
 	if len(objects) == 0 {
 		return nil, errors.New("no snack bags found")
 	}
-	best, ok := objects[0].(map[string]interface{})
+	var reasons []string
+	for i, raw := range objects {
+		target, reason := parseSnack(raw)
+		if target == nil {
+			s.logger.Debugf("pick: skipping segment %d: %s", i, reason)
+			reasons = append(reasons, reason)
+			continue
+		}
+		target.candidates = len(objects)
+		target.rejected = len(reasons)
+		return target, nil
+	}
+	return nil, fmt.Errorf("none of the %d segments is a plausible bag in the bin; first rejection: %s",
+		len(objects), reasons[0])
+}
+
+// parseSnack returns the target for one sam3 segment, or nil and the reason
+// it is not a plausible bag in the bin.
+func parseSnack(raw interface{}) (*snackTarget, string) {
+	obj, ok := raw.(map[string]interface{})
 	if !ok {
-		return nil, fmt.Errorf("unexpected object from %s: %v", sam3VisionName, objects[0])
+		return nil, fmt.Sprintf("unexpected object %v", raw)
 	}
-	if frame := fmt.Sprint(best["reference_frame"]); frame != referenceframe.World {
-		return nil, fmt.Errorf("snack bag is in frame %q, not world; check the camera's frame config", frame)
+	if frame := fmt.Sprint(obj["reference_frame"]); frame != referenceframe.World {
+		return nil, fmt.Sprintf("frame %q is not world; check the camera's frame config", frame)
 	}
-	center, err := readVec(best["center_mm"])
+	center, err := readVec(obj["center_mm"])
 	if err != nil {
-		return nil, fmt.Errorf("center_mm: %w", err)
+		return nil, "center_mm: " + err.Error()
 	}
-	maxes, err := readVec(best["max_mm"])
+	dims, err := readVec(obj["dims_mm"])
 	if err != nil {
-		return nil, fmt.Errorf("max_mm: %w", err)
+		return nil, "dims_mm: " + err.Error()
 	}
-	confidence, _ := best["confidence"].(float64)
+	maxes, err := readVec(obj["max_mm"])
+	if err != nil {
+		return nil, "max_mm: " + err.Error()
+	}
+	if center.X < binMin.X || center.X > binMax.X || center.Y < binMin.Y || center.Y > binMax.Y ||
+		center.Z < binMin.Z || center.Z > binMax.Z {
+		return nil, fmt.Sprintf("center (%.0f, %.0f, %.0f) is outside the bin", center.X, center.Y, center.Z)
+	}
+	if size := math.Max(dims.X, math.Max(dims.Y, dims.Z)); size < minBagSizeMm || size > maxBagSizeMm {
+		return nil, fmt.Sprintf("largest side %.0f mm is not bag-sized (%.0f-%.0f mm)", size, minBagSizeMm, maxBagSizeMm)
+	}
+	confidence, _ := obj["confidence"].(float64)
 	return &snackTarget{
-		label:      fmt.Sprint(best["label"]),
+		label:      fmt.Sprint(obj["label"]),
 		confidence: confidence,
 		center:     center,
 		topZ:       maxes.Z,
-		candidates: len(objects),
-	}, nil
+	}, ""
 }
 
 func readVec(v interface{}) (r3.Vector, error) {
@@ -173,6 +220,7 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 		"label":      target.label,
 		"confidence": target.confidence,
 		"candidates": target.candidates,
+		"rejected":   target.rejected,
 		"center_mm":  vec(target.center),
 		"top_z_mm":   target.topZ,
 		"hover_mm":   vec(hover),

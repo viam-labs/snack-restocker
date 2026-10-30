@@ -166,7 +166,12 @@ Grabs the snack bag SAM3 is most confident about. **This moves the arm.** It is 
 The steps:
 
 1. Go to `restock-1-find` so the camera sees the bin.
-2. Ask `sam3-vision` for point clouds and take the first object, which has the highest confidence. Its position must be in the `world` frame.
+2. Ask `sam3-vision` for point clouds, which come back highest confidence first, and take the first one that is a plausible bag in the bin:
+   - its position is in the `world` frame,
+   - its center is inside the `bin` obstacle's footprint (centered at (250, -439), 555 × 355 mm) and between z = -50 and 450 mm,
+   - its largest side is 40 to 400 mm.
+
+   Segments that fail these checks come from bad depth readings, such as far-away background pixels inside a mask. They are skipped and counted in `rejected`. If none pass, the command fails without moving toward a bag.
 3. Open the gripper.
 4. Move `gripper-tcp`, pointing straight down, to `approach_mm` above the top of the bag.
 5. Descend in a straight line to `grasp_depth_mm` below the top of the bag.
@@ -194,6 +199,7 @@ On success:
   "label": "snack bag",
   "confidence": 0.91,
   "candidates": 3,
+  "rejected": 1,
   "center_mm": { "x": 250, "y": -440, "z": 70 },
   "top_z_mm": 100,
   "hover_mm": { "x": 250, "y": -440, "z": 220 },
