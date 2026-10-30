@@ -157,7 +157,7 @@ Forces the state machine back to `idle` from any state. It **does not move the a
 
 ### `pick_snack`
 
-Grabs the snack bag SAM3 is most confident about. **This moves the arm.** It is separate from `restock`: it does not use or change the state machine.
+Grabs the snack bag SAM3 is most confident about, or the next most confident one it can reach. **This moves the arm.** It is separate from `restock`: it does not use or change the state machine.
 
 ```json
 { "pick_snack": true }
@@ -166,17 +166,19 @@ Grabs the snack bag SAM3 is most confident about. **This moves the arm.** It is 
 The steps:
 
 1. Go to `restock-1-find` so the camera sees the bin.
-2. Ask `sam3-vision` for point clouds, which come back highest confidence first, and take the first one that is a plausible bag in the bin:
+2. Ask `sam3-vision` for point clouds, which come back highest confidence first, and keep the ones that are plausible bags in the bin:
    - its position is in the `world` frame,
    - its center is inside the `bin` obstacle's footprint (centered at (250, -439), 555 × 355 mm) and between z = -50 and 450 mm,
    - its largest side is 40 to 400 mm.
 
    Segments that fail these checks come from bad depth readings, such as far-away background pixels inside a mask. They are skipped and counted in `rejected`. If none pass, the command fails without moving toward a bag.
 3. Open the gripper.
-4. Move `gripper-tcp`, pointing straight down, to `approach_mm` above the top of the bag.
-5. Descend in a straight line to `grasp_depth_mm` below the top of the bag.
-6. Close the gripper (30).
-7. Lift straight back up to the hover point.
+4. For each plausible bag, most confident first (up to `max_bags`), and for each gripper rotation (0°, then 90° about the vertical):
+   1. Move `gripper-tcp`, pointing straight down, to `approach_mm` above the top of the bag.
+   2. Descend in a straight line to `grasp_depth_mm` below the top of the bag.
+
+   If the motion planner refuses the hover or the descend, for example because the open claws would hit a bin wall, the refusal is recorded in `attempts` and it tries the next rotation, then the next bag. A rotation of 90° turns the claws parallel to a wall the bag is lying against. The arm stays at the last pose it reached, and the next move is planned from there.
+5. Once at a bag: close the gripper (30), then lift straight back up to the hover point. A failure here is not retried.
 
 The arm stays at the hover point holding the bag.
 
@@ -184,10 +186,11 @@ Optional fields:
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `dry_run` | `false` | Go to `restock-1-find` and find the bag, but do not open the gripper or move toward the bag. Returns the planned poses. |
-| `hover_only` | `false` | Stop at the hover point with the gripper open. |
+| `dry_run` | `false` | Go to `restock-1-find` and find the bags, but do not open the gripper or move toward a bag. Returns the poses for the most confident plausible bag at rotation 0. |
+| `hover_only` | `false` | Stop at the first hover point it can reach, with the gripper open. |
 | `approach_mm` | `120` | Height of the hover point above the top of the bag. |
 | `grasp_depth_mm` | `20` | How far below the top of the bag the gripper closes. |
+| `max_bags` | `3` | How many plausible bags to try before giving up. |
 
 Test in this order: `dry_run`, then `hover_only`, then a full pick.
 
@@ -196,20 +199,37 @@ On success:
 ```json
 {
   "pick_snack": "complete",
+  "bag": 1,
   "label": "snack bag",
-  "confidence": 0.91,
-  "candidates": 3,
-  "rejected": 1,
-  "center_mm": { "x": 250, "y": -440, "z": 70 },
-  "top_z_mm": 100,
-  "hover_mm": { "x": 250, "y": -440, "z": 220 },
-  "grasp_mm": { "x": 250, "y": -440, "z": 80 },
+  "confidence": 0.93,
+  "rotation_deg": 90,
+  "candidates": 27,
+  "rejected": 4,
+  "plausible": 3,
+  "center_mm": { "x": 121, "y": -419, "z": 181 },
+  "top_z_mm": 264,
+  "hover_mm": { "x": 121, "y": -419, "z": 384 },
+  "grasp_mm": { "x": 121, "y": -419, "z": 244 },
+  "attempts": [
+    {
+      "bag": 1,
+      "confidence": 0.93,
+      "center_mm": { "x": 121, "y": -419, "z": 181 },
+      "rotation_deg": 0,
+      "stage": "descend",
+      "error": "descend to snack: ... violation between bin:bin-left and gripper:claws ..."
+    }
+  ],
   "steps": ["..."],
-  "steps_completed": 6
+  "steps_completed": 8
 }
 ```
 
-`pick_snack` is `"planned"` for a dry run and `"hovering"` for `hover_only`. If no bag is found, `sam3-vision` returns an error, or a move fails, it returns `{"pick_snack": "failed", "error": "<reason>"}` and the arm is left where it stopped.
+- `bag` is the rank of the bag it grabbed among the plausible bags (1 = most confident). `rotation_deg` is the gripper rotation it used.
+- `candidates` is the number of SAM3 segments, `rejected` how many failed the plausibility checks, and `plausible` how many bags it would try (at most `max_bags`).
+- `attempts` lists every refused hover or descend.
+
+`pick_snack` is `"planned"` for a dry run and `"hovering"` for `hover_only`. If no bag or rotation can be reached, it returns `"pick_snack": "failed"` with an `error` and the full `attempts` list, and the gripper is left open at the last pose reached. If no bag is found, `sam3-vision` returns an error, or the gripper or lift fails, it returns `{"pick_snack": "failed", "error": "<reason>"}` and the arm is left where it stopped.
 
 ### Unknown commands
 

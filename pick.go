@@ -51,45 +51,53 @@ const (
 	maxBagSizeMm = 400.0
 )
 
+// Gripper rotations about the vertical to try for each bag, in degrees. 90
+// turns the claws parallel to a bin wall the bag is lying against.
+var gripperRotations = []float64{0, 90}
+
+// How many plausible bags to try before giving up, by default.
+const defaultMaxBags = 3
+
 // Straight-line tolerance for the descend and lift moves.
 var straightDown = &motionplan.Constraints{
 	LinearConstraint: []motionplan.LinearConstraint{{LineToleranceMm: 10, OrientationToleranceDegs: 5}},
 }
 
-// snackTarget is the best SAM3 segment, in the world frame.
+// snackTarget is a plausible SAM3 segment, in the world frame.
 type snackTarget struct {
 	label      string
 	confidence float64
 	center     r3.Vector
 	topZ       float64
-	candidates int
-	rejected   int
 }
 
-// topDown is the tool pointing straight down (-Z in world).
-func topDown(p r3.Vector) *referenceframe.PoseInFrame {
+// topDown is the tool pointing straight down (-Z in world), rotated by
+// rotationDeg about the vertical.
+func topDown(p r3.Vector, rotationDeg float64) *referenceframe.PoseInFrame {
 	return referenceframe.NewPoseInFrame(referenceframe.World,
-		spatialmath.NewPose(p, &spatialmath.OrientationVectorDegrees{OZ: -1}))
+		spatialmath.NewPose(p, &spatialmath.OrientationVectorDegrees{OZ: -1, Theta: rotationDeg}))
 }
 
 func vec(v r3.Vector) map[string]interface{} {
 	return map[string]interface{}{"x": v.X, "y": v.Y, "z": v.Z}
 }
 
-// findSnack asks sam3-vision for segments (sorted best-first) and returns the
-// first one that could be a real bag in the bin.
-func (s *snackRestockerRestocker) findSnack(ctx context.Context) (*snackTarget, error) {
+// findSnacks asks sam3-vision for segments (sorted best-first) and returns
+// the ones that could be a real bag in the bin, in the same order, plus the
+// total number of segments.
+func (s *snackRestockerRestocker) findSnacks(ctx context.Context) ([]*snackTarget, int, error) {
 	resp, err := s.vision.DoCommand(ctx, map[string]interface{}{"command": "get_object_point_clouds"})
 	if err != nil {
-		return nil, fmt.Errorf("%s get_object_point_clouds: %w", sam3VisionName, err)
+		return nil, 0, fmt.Errorf("%s get_object_point_clouds: %w", sam3VisionName, err)
 	}
 	if msg, ok := resp["error"]; ok {
-		return nil, fmt.Errorf("%s: %v", sam3VisionName, msg)
+		return nil, 0, fmt.Errorf("%s: %v", sam3VisionName, msg)
 	}
 	objects, _ := resp["objects"].([]interface{})
 	if len(objects) == 0 {
-		return nil, errors.New("no snack bags found")
+		return nil, 0, errors.New("no snack bags found")
 	}
+	var targets []*snackTarget
 	var reasons []string
 	for i, raw := range objects {
 		target, reason := parseSnack(raw)
@@ -98,12 +106,13 @@ func (s *snackRestockerRestocker) findSnack(ctx context.Context) (*snackTarget, 
 			reasons = append(reasons, reason)
 			continue
 		}
-		target.candidates = len(objects)
-		target.rejected = len(reasons)
-		return target, nil
+		targets = append(targets, target)
 	}
-	return nil, fmt.Errorf("none of the %d segments is a plausible bag in the bin; first rejection: %s",
-		len(objects), reasons[0])
+	if len(targets) == 0 {
+		return nil, len(objects), fmt.Errorf("none of the %d segments is a plausible bag in the bin; first rejection: %s",
+			len(objects), reasons[0])
+	}
+	return targets, len(objects), nil
 }
 
 // parseSnack returns the target for one sam3 segment, or nil and the reason
@@ -158,14 +167,17 @@ func readVec(v interface{}) (r3.Vector, error) {
 	return r3.Vector{X: x, Y: y, Z: z}, nil
 }
 
-// moveTCP plans and runs a move of the gripper TCP to a world pose.
+// moveTCP plans and runs a move of the gripper TCP to a world pose, pointing
+// down and rotated by rotationDeg.
 func (s *snackRestockerRestocker) moveTCP(
-	ctx context.Context, desc string, p r3.Vector, constraints *motionplan.Constraints, step int, steps *[]interface{},
+	ctx context.Context, desc string, p r3.Vector, rotationDeg float64, constraints *motionplan.Constraints,
+	step int, steps *[]interface{},
 ) error {
-	s.logger.Infof("pick step %d: %s, moving %s to (%.0f, %.0f, %.0f) mm", step, desc, tcpFrame, p.X, p.Y, p.Z)
+	s.logger.Infof("pick step %d: %s, moving %s to (%.0f, %.0f, %.0f) mm, rotation %.0f deg",
+		step, desc, tcpFrame, p.X, p.Y, p.Z, rotationDeg)
 	if _, err := s.motion.Move(ctx, motion.MoveReq{
 		ComponentName: tcpFrame,
-		Destination:   topDown(p),
+		Destination:   topDown(p, rotationDeg),
 		Constraints:   constraints,
 	}); err != nil {
 		return fmt.Errorf("%s: %w", desc, err)
@@ -173,12 +185,14 @@ func (s *snackRestockerRestocker) moveTCP(
 	if err := sleep(ctx, stepDelay); err != nil {
 		return err
 	}
-	*steps = append(*steps, fmt.Sprintf("%s: %s to (%.0f, %.0f, %.0f)", desc, tcpFrame, p.X, p.Y, p.Z))
+	*steps = append(*steps, fmt.Sprintf("%s: %s to (%.0f, %.0f, %.0f) rotation %.0f",
+		desc, tcpFrame, p.X, p.Y, p.Z, rotationDeg))
 	return nil
 }
 
-// runPick runs pick_snack. dryRun stops after finding the bag; hoverOnly
-// stops above it with the gripper open.
+// runPick runs pick_snack. It tries the plausible bags best-first, each at
+// every gripper rotation, until one can be reached. dryRun stops after
+// finding the bags; hoverOnly stops above the first bag it can hover over.
 func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	if s.vision == nil || s.motion == nil {
 		return nil, fmt.Errorf("pick_snack needs the '%s' vision service and '%s' motion service on the machine",
@@ -194,6 +208,10 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 	if v, ok := cmd["grasp_depth_mm"].(float64); ok {
 		graspDepthMm = v
 	}
+	maxBags := defaultMaxBags
+	if v, ok := cmd["max_bags"].(float64); ok && v >= 1 {
+		maxBags = int(v)
+	}
 
 	steps := []interface{}{}
 	step := 0
@@ -206,55 +224,105 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 	if err := s.goToPose(ctx, pickViewSwitch, next(), &steps); err != nil {
 		return nil, err
 	}
-	target, err := s.findSnack(ctx)
+	targets, total, err := s.findSnacks(ctx)
 	if err != nil {
 		return nil, err
 	}
-	hover := r3.Vector{X: target.center.X, Y: target.center.Y, Z: target.topZ + approachMm}
-	grasp := r3.Vector{X: target.center.X, Y: target.center.Y, Z: target.topZ - graspDepthMm}
-	s.logger.Infof("pick: best of %d is %q (confidence %.2f), center (%.0f, %.0f, %.0f) mm, top z %.0f mm",
-		target.candidates, target.label, target.confidence,
-		target.center.X, target.center.Y, target.center.Z, target.topZ)
+	rejected := total - len(targets)
+	if len(targets) > maxBags {
+		targets = targets[:maxBags]
+	}
 
+	attempts := []interface{}{}
 	result := map[string]interface{}{
-		"label":      target.label,
-		"confidence": target.confidence,
-		"candidates": target.candidates,
-		"rejected":   target.rejected,
-		"center_mm":  vec(target.center),
-		"top_z_mm":   target.topZ,
-		"hover_mm":   vec(hover),
-		"grasp_mm":   vec(grasp),
+		"candidates": total,
+		"rejected":   rejected,
+		"plausible":  len(targets),
 		"dry_run":    dryRun,
 		"hover_only": hoverOnly,
 	}
+	// selectBag records the bag (1 = most confident plausible bag) and
+	// rotation used in the result.
+	selectBag := func(rank int, t *snackTarget, rotation float64, hover, grasp r3.Vector) {
+		result["bag"] = rank
+		result["label"] = t.label
+		result["confidence"] = t.confidence
+		result["center_mm"] = vec(t.center)
+		result["top_z_mm"] = t.topZ
+		result["rotation_deg"] = rotation
+		result["hover_mm"] = vec(hover)
+		result["grasp_mm"] = vec(grasp)
+	}
 	finish := func(status string) map[string]interface{} {
 		result["pick_snack"] = status
+		result["attempts"] = attempts
 		result["steps"] = steps
 		result["steps_completed"] = step
 		return result
 	}
+	posesFor := func(t *snackTarget) (r3.Vector, r3.Vector) {
+		return r3.Vector{X: t.center.X, Y: t.center.Y, Z: t.topZ + approachMm},
+			r3.Vector{X: t.center.X, Y: t.center.Y, Z: t.topZ - graspDepthMm}
+	}
+
 	if dryRun {
+		hover, grasp := posesFor(targets[0])
+		selectBag(1, targets[0], gripperRotations[0], hover, grasp)
 		return finish("planned"), nil
 	}
 
 	if err := s.setGripper(ctx, gripperOpen, next(), &steps); err != nil {
 		return nil, err
 	}
-	if err := s.moveTCP(ctx, "hover above snack", hover, nil, next(), &steps); err != nil {
-		return nil, err
+	for i, t := range targets {
+		hover, grasp := posesFor(t)
+		s.logger.Infof("pick: trying bag %d of %d, %q (confidence %.2f), center (%.0f, %.0f, %.0f) mm, top z %.0f mm",
+			i+1, len(targets), t.label, t.confidence, t.center.X, t.center.Y, t.center.Z, t.topZ)
+		for _, rotation := range gripperRotations {
+			// A refused hover or descend is a planning failure: record it and
+			// try the next rotation or bag. The arm is left at the last pose
+			// it reached, and the next move plans from there.
+			refused := func(stage string, err error) {
+				s.logger.Infof("pick: bag %d rotation %.0f: %s refused: %v", i+1, rotation, stage, err)
+				attempts = append(attempts, map[string]interface{}{
+					"bag":          i + 1,
+					"confidence":   t.confidence,
+					"center_mm":    vec(t.center),
+					"rotation_deg": rotation,
+					"stage":        stage,
+					"error":        err.Error(),
+				})
+			}
+			if err := s.moveTCP(ctx, "hover above snack", hover, rotation, nil, next(), &steps); err != nil {
+				if ctx.Err() != nil {
+					return nil, err
+				}
+				refused("hover", err)
+				continue
+			}
+			if hoverOnly {
+				selectBag(i+1, t, rotation, hover, grasp)
+				return finish("hovering"), nil
+			}
+			if err := s.moveTCP(ctx, "descend to snack", grasp, rotation, straightDown, next(), &steps); err != nil {
+				if ctx.Err() != nil {
+					return nil, err
+				}
+				refused("descend", err)
+				continue
+			}
+			// At the bag: from here a failure is not retried.
+			selectBag(i+1, t, rotation, hover, grasp)
+			if err := s.setGripper(ctx, gripperClose, next(), &steps); err != nil {
+				return nil, err
+			}
+			if err := s.moveTCP(ctx, "lift snack", hover, rotation, straightDown, next(), &steps); err != nil {
+				return nil, err
+			}
+			return finish("complete"), nil
+		}
 	}
-	if hoverOnly {
-		return finish("hovering"), nil
-	}
-	if err := s.moveTCP(ctx, "descend to snack", grasp, straightDown, next(), &steps); err != nil {
-		return nil, err
-	}
-	if err := s.setGripper(ctx, gripperClose, next(), &steps); err != nil {
-		return nil, err
-	}
-	if err := s.moveTCP(ctx, "lift snack", hover, straightDown, next(), &steps); err != nil {
-		return nil, err
-	}
-	return finish("complete"), nil
+	result["error"] = fmt.Sprintf("could not reach any of the %d plausible bags at rotations %v; see attempts",
+		len(targets), gripperRotations)
+	return finish("failed"), nil
 }

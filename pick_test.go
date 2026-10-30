@@ -2,6 +2,7 @@ package snackrestocker
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -9,16 +10,31 @@ import (
 	toggleswitch "go.viam.com/rdk/components/switch"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/services/motion"
+	"go.viam.com/rdk/spatialmath"
 	"go.viam.com/rdk/testutils/inject"
 	injectmotion "go.viam.com/rdk/testutils/inject/motion"
 )
 
 type pickRig struct {
-	s       *snackRestockerRestocker
-	moves   []r3.Vector
-	linear  []bool
-	grips   []interface{}
-	visited []string
+	s         *snackRestockerRestocker
+	moves     []r3.Vector
+	rotations []float64
+	linear    []bool
+	grips     []interface{}
+	visited   []string
+	// refuse, if set, makes the fake planner reject a move to p at rotation.
+	refuse func(p r3.Vector, rotation float64) bool
+}
+
+// rotationOf returns which of gripperRotations a pointing-down orientation
+// uses, or -1.
+func rotationOf(o spatialmath.Orientation) float64 {
+	for _, rot := range gripperRotations {
+		if spatialmath.OrientationAlmostEqual(o, &spatialmath.OrientationVectorDegrees{OZ: -1, Theta: rot}) {
+			return rot
+		}
+	}
+	return -1
 }
 
 // newPickRig fakes the switch, gripper, motion and sam3-vision resources and
@@ -50,7 +66,16 @@ func newPickRig(t *testing.T, sam3Resp map[string]interface{}) *pickRig {
 		if ov.OZ > -0.99 {
 			t.Fatalf("tool not pointing down: %+v", ov)
 		}
-		rig.moves = append(rig.moves, req.Destination.Pose().Point())
+		p := req.Destination.Pose().Point()
+		rot := rotationOf(req.Destination.Pose().Orientation())
+		if rot < 0 {
+			t.Fatalf("unexpected gripper rotation: %+v", ov)
+		}
+		if rig.refuse != nil && rig.refuse(p, rot) {
+			return false, errors.New("all IK solutions failed constraints: violation between bin:bin-left and gripper:claws")
+		}
+		rig.moves = append(rig.moves, p)
+		rig.rotations = append(rig.rotations, rot)
 		rig.linear = append(rig.linear, req.Constraints != nil && len(req.Constraints.LinearConstraint) > 0)
 		return true, nil
 	}
@@ -209,5 +234,88 @@ func TestPickSnackFailsWhenNoSegmentIsPlausible(t *testing.T) {
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
 	if resp["pick_snack"] != "failed" || len(rig.moves) != 0 || len(rig.grips) != 0 {
 		t.Fatalf("should fail without moving toward the bag: %v moves=%v grips=%v", resp, rig.moves, rig.grips)
+	}
+}
+
+// twoBags puts bag 1 (0.9) at x=250 and bag 2 (0.6) at x=150; tops at z=100
+// and z=90, so with the defaults the grab points are z=80 and z=70.
+
+func TestPickSnackRotatesWhenDescendIsRefused(t *testing.T) {
+	rig := newPickRig(t, twoBags())
+	rig.refuse = func(p r3.Vector, rotation float64) bool {
+		return p.Z == 80 && rotation == 0 // bag 1's descend hits the wall unrotated
+	}
+	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
+	if resp["pick_snack"] != "complete" || resp["bag"] != 1 || resp["rotation_deg"] != 90.0 {
+		t.Fatalf("should grab bag 1 rotated 90: %v", resp)
+	}
+	attempts := resp["attempts"].([]interface{})
+	if len(attempts) != 1 {
+		t.Fatalf("attempts: %v", attempts)
+	}
+	a := attempts[0].(map[string]interface{})
+	if a["bag"] != 1 || a["rotation_deg"] != 0.0 || a["stage"] != "descend" {
+		t.Fatalf("attempt: %v", a)
+	}
+	// hover 0, hover 90, descend 90, lift 90.
+	wantRot := []float64{0, 90, 90, 90}
+	if len(rig.rotations) != len(wantRot) {
+		t.Fatalf("rotations: %v", rig.rotations)
+	}
+	for i := range wantRot {
+		if rig.rotations[i] != wantRot[i] {
+			t.Fatalf("rotations: %v", rig.rotations)
+		}
+	}
+	if len(rig.grips) != 2 || rig.grips[1] != gripperClose {
+		t.Fatalf("gripper: %v", rig.grips)
+	}
+}
+
+func TestPickSnackMovesToNextBagWhenBothRotationsFail(t *testing.T) {
+	rig := newPickRig(t, twoBags())
+	rig.refuse = func(p r3.Vector, rotation float64) bool { return p.Z == 80 } // bag 1 unreachable
+	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
+	if resp["pick_snack"] != "complete" || resp["bag"] != 2 || resp["rotation_deg"] != 0.0 {
+		t.Fatalf("should grab bag 2: %v", resp)
+	}
+	if c := resp["center_mm"].(map[string]interface{}); c["x"] != 150.0 {
+		t.Fatalf("center: %v", c)
+	}
+	if n := len(resp["attempts"].([]interface{})); n != 2 {
+		t.Fatalf("both rotations of bag 1 should be recorded: %v", resp["attempts"])
+	}
+}
+
+func TestPickSnackReportsAttemptsWhenNothingIsReachable(t *testing.T) {
+	rig := newPickRig(t, twoBags())
+	rig.refuse = func(p r3.Vector, rotation float64) bool { return p.Z < 100 } // every descend
+	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
+	if resp["pick_snack"] != "failed" || resp["error"] == nil {
+		t.Fatalf("should fail: %v", resp)
+	}
+	if n := len(resp["attempts"].([]interface{})); n != 4 {
+		t.Fatalf("2 bags x 2 rotations should be recorded: %v", resp["attempts"])
+	}
+	if len(rig.grips) != 1 || rig.grips[0] != gripperOpen {
+		t.Fatalf("gripper should only open: %v", rig.grips)
+	}
+}
+
+func TestPickSnackMaxBags(t *testing.T) {
+	rig := newPickRig(t, twoBags())
+	rig.refuse = func(p r3.Vector, rotation float64) bool { return p.Z == 80 }
+	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true, "max_bags": 1.0})
+	if resp["pick_snack"] != "failed" || resp["plausible"] != 1 {
+		t.Fatalf("should only try bag 1: %v", resp)
+	}
+}
+
+func TestPickSnackHoverOnlyRotatesWhenHoverIsRefused(t *testing.T) {
+	rig := newPickRig(t, twoBags())
+	rig.refuse = func(p r3.Vector, rotation float64) bool { return rotation == 0 }
+	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true, "hover_only": true})
+	if resp["pick_snack"] != "hovering" || resp["bag"] != 1 || resp["rotation_deg"] != 90.0 {
+		t.Fatalf("should hover over bag 1 rotated 90: %v", resp)
 	}
 }
