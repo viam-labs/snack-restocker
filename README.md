@@ -26,6 +26,13 @@ It requires these resources on the machine, under these exact names:
 | `restock-1-find` … `restock-5-drop` | switch | Pick up the snack and drop it in the drawer (5 poses). |
 | `close-1-set-back`, `close-2-lower`, `close-3-push1`, `close-4-push2` | switch | Push the drawer shut. |
 
+These are optional, and only `restock_fixture` uses them. Without them the service still starts and `restock` works:
+
+| Resource | Type | Used for |
+|----------|------|----------|
+| `drawer-open` | generic service (`viam-labs:restock-bot:fixture-teacher`) | Opening the drawer with its taught `open` motion. |
+| `draw-closer` | generic service (`viam-labs:restock-bot:fixture-teacher`) | Closing the drawer with its taught `close` motion. |
+
 Each switch is moved with `SetPosition(2)`, which sends the arm to that switch's saved pose. The module waits 1 second after every move and every gripper command.
 
 ## State machine
@@ -86,6 +93,26 @@ If any move or gripper command fails, the sequence stops where it is, the state 
 ```
 
 The arm is left wherever it stopped.
+
+### `restock_fixture`
+
+Runs the same restock sequence as `restock`, except the drawer is opened and closed by the `drawer-open` and `draw-closer` services instead of the `open-drawer-*` and `close-*` poses. Those services find the drawer's AprilTag and replay motions taught relative to it, so they still work if the drawer moves. **This moves the arm.** `restock` is unchanged.
+
+```json
+{ "restock_fixture": true }
+```
+
+| State | What happens |
+|-------|--------------|
+| `finding_drawer` | Close the gripper fully. `drawer-open` moves to its own view pose to find the drawer. |
+| `opening_drawer` | `drawer-open`: `{"cmd": "run", "motion": "open"}`. |
+| `picking_up_snack` | Same as `restock`. |
+| `restocking` | Same as `restock`. |
+| `closing_drawer` | `draw-closer`: `{"cmd": "run", "motion": "close"}`, then go to `open-drawer-0-position`. |
+
+It uses the same state machine and returns the same shape as `restock`, under a `restock_fixture` key. If a drawer motion reports an `error`, the sequence stops there, the state resets to `idle`, and it returns `{"restock_fixture": "failed", "error": "<reason>", "state": "idle"}`.
+
+To check where the drawer motions will go without running them, send `{"cmd": "run", "motion": "open", "dry_run": true}` to `drawer-open` (or `"close"` to `draw-closer`) directly.
 
 ### `get_state`
 
