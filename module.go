@@ -11,6 +11,8 @@ import (
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	generic "go.viam.com/rdk/services/generic"
+	"go.viam.com/rdk/services/motion"
+	"go.viam.com/rdk/services/vision"
 )
 
 var Restocker = resource.NewModel("viam", "snack-restocker", "restocker")
@@ -125,10 +127,12 @@ func init() {
 type Config struct{}
 
 // Validate requires the gripper and every pose-saver switch used by the
-// restock sequence. The fixture-teacher drawer services are optional; only
-// restock_fixture uses them.
+// restock sequence. The fixture-teacher drawer services and the SAM3 vision
+// and motion services are optional; only restock_fixture and pick_snack use
+// them.
 func (cfg Config) Validate(path string) ([]string, []string, error) {
-	return append([]string{gripperName}, allSwitches()...), []string{drawerOpenerName, drawerCloserName}, nil
+	optional := []string{drawerOpenerName, drawerCloserName, sam3VisionName, motionName}
+	return append([]string{gripperName}, allSwitches()...), optional, nil
 }
 
 // allSwitches lists every pose-saver switch used by the restock sequence.
@@ -155,6 +159,10 @@ type snackRestockerRestocker struct {
 	// only by restock_fixture.
 	drawerOpener resource.Resource
 	drawerCloser resource.Resource
+
+	// Optional; nil when not on the machine. Used only by pick_snack.
+	vision vision.Service
+	motion motion.Service
 
 	mu    sync.Mutex
 	state State
@@ -197,6 +205,16 @@ func NewRestocker(ctx context.Context, deps resource.Dependencies, name resource
 		logger.Infof("%s not available, restock_fixture disabled: %v", drawerCloserName, err)
 		drawerCloser = nil
 	}
+	visionSvc, err := vision.FromDependencies(deps, sam3VisionName)
+	if err != nil {
+		logger.Infof("%s not available, pick_snack disabled: %v", sam3VisionName, err)
+		visionSvc = nil
+	}
+	motionSvc, err := motion.FromDependencies(deps, motionName)
+	if err != nil {
+		logger.Infof("%s motion service not available, pick_snack disabled: %v", motionName, err)
+		motionSvc = nil
+	}
 
 	cancelCtx, cancelFunc := context.WithCancel(context.Background())
 
@@ -208,6 +226,8 @@ func NewRestocker(ctx context.Context, deps resource.Dependencies, name resource
 		switches:     switches,
 		drawerOpener: drawerOpener,
 		drawerCloser: drawerCloser,
+		vision:       visionSvc,
+		motion:       motionSvc,
 		state:        initialState,
 		cancelCtx:    cancelCtx,
 		cancelFunc:   cancelFunc,
@@ -496,6 +516,15 @@ func (s *snackRestockerRestocker) DoCommand(ctx context.Context, cmd map[string]
 		return result, nil
 	}
 
+	if pick, _ := cmd["pick_snack"].(bool); pick {
+		result, err := s.runPick(ctx, cmd)
+		if err != nil {
+			s.logger.Errorf("pick_snack failed: %v", err)
+			return map[string]interface{}{"pick_snack": "failed", "error": err.Error()}, nil
+		}
+		return result, nil
+	}
+
 	if _, ok := cmd["get_state"]; ok {
 		return s.stateReport(nil), nil
 	}
@@ -542,10 +571,11 @@ func (s *snackRestockerRestocker) DoCommand(ctx context.Context, cmd map[string]
 		"usage": `send {"restock": true} to run the restock sequence, ` +
 			`{"restock_fixture": true} to run it with the drawer-open and draw-closer services, ` +
 			`{"get_state": true} to read the state machine, ` +
+			`{"pick_snack": true} to grab the best SAM3 snack bag, ` +
 			`{"advance_state": true} to step to the next state, ` +
 			`{"set_state": "<state>", "force": false} to set a state, ` +
 			`or {"reset_state": true} to return to idle`,
-		"supported_commands": []interface{}{"restock", "restock_fixture", "get_state", "advance_state", "set_state", "reset_state"},
+		"supported_commands": []interface{}{"restock", "restock_fixture", "pick_snack", "get_state", "advance_state", "set_state", "reset_state"},
 		"states":             stateStrings(stateSequence),
 		"state":              string(s.currentState()),
 	}, nil
