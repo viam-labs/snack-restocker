@@ -231,6 +231,27 @@ On success:
 
 `pick_snack` is `"planned"` for a dry run and `"hovering"` for `hover_only`. If no bag or rotation can be reached, it returns `"pick_snack": "failed"` with an `error` and the full `attempts` list, and the gripper is left open at the last pose reached. If no bag is found, `sam3-vision` returns an error, or the gripper or lift fails, it returns `{"pick_snack": "failed", "error": "<reason>"}` and the arm is left where it stopped.
 
+### `pick_and_place`
+
+Runs `pick_snack` and then drops the bag over the drawer, twice by default:
+
+```json
+{ "pick_and_place": true }
+```
+
+Each round grabs the best plausible bag with `pick_snack`, moves through `restock-4-view-drawer` and `restock-5-drop`, and opens the gripper to release it. It doesn't open or close the drawer. It takes every `pick_snack` option, plus `rounds` (default `2`).
+
+It stops at the first round whose pick doesn't complete, without going to the drawer, and returns that round's status (`"failed"`, or `"planned"`/`"hovering"` for `dry_run`/`hover_only`). The result lists each round's pick result and place steps:
+
+```json
+{
+  "pick_and_place": "complete",
+  "rounds": 2,
+  "rounds_completed": 2,
+  "results": [{ "round": 1, "pick": { "pick_snack": "complete", "...": "..." }, "place_steps": ["..."] }, "..."]
+}
+```
+
 ### Unknown commands
 
 Any other command returns an `error` field with a `usage` string, `supported_commands`, all `states`, and the current `state`.
