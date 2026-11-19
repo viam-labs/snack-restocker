@@ -11,11 +11,17 @@ This module provides the following model(s):
 
 ## Configuration
 
-The service takes no attributes:
+All attributes are optional:
 
 ```json
-{}
+{
+  "grasp_depth_mm": 20
+}
 ```
+
+| Attribute | Default | Description |
+|-----------|---------|-------------|
+| `grasp_depth_mm` | `20` | How far below the top of a bag `pick_snack` closes the gripper, in mm. Must be 0 or more. A `grasp_depth_mm` field in a `pick_snack` or `pick_and_place` call overrides it. |
 
 It requires these resources on the machine, under these exact names:
 
@@ -191,7 +197,7 @@ Optional fields:
 | `hover_only` | `false` | Stop at the first hover point it can reach, with the gripper open. |
 | `approach_mm` | `120` | Height of the hover point above the top of the bag, before the rim cap. |
 | `hover_above_rim_mm` | `50` | Highest hover point, above the bin rim. A high hover far from the arm base has no straight-down IK solution. |
-| `grasp_depth_mm` | `20` | How far below the top of the bag the gripper closes. |
+| `grasp_depth_mm` | `20`, or the `grasp_depth_mm` attribute | How far below the top of the bag the gripper closes. |
 | `max_bags` | `3` | How many plausible bags to try before giving up. |
 
 Test in this order: `dry_run`, then `hover_only`, then a full pick.

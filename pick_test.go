@@ -409,3 +409,30 @@ func TestToolOrientationLeansWristTowardBinCenter(t *testing.T) {
 		t.Fatalf("tilt %v, want %v", got, hoverFallbackTiltDeg)
 	}
 }
+
+func TestPickSnackUsesConfiguredGraspDepth(t *testing.T) {
+	depth := 35.0
+	rig := newPickRig(t, twoBags())
+	rig.s.cfg.GraspDepthMm = &depth
+	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true, "dry_run": true})
+	if grasp := resp["grasp_mm"].(map[string]interface{}); grasp["z"] != 100-depth {
+		t.Fatalf("grasp should use the configured depth: %v", grasp)
+	}
+	resp, _ = rig.s.DoCommand(context.Background(), map[string]interface{}{
+		"pick_snack": true, "dry_run": true, "grasp_depth_mm": 10.0,
+	})
+	if grasp := resp["grasp_mm"].(map[string]interface{}); grasp["z"] != 90.0 {
+		t.Fatalf("the DoCommand field should override the configured depth: %v", grasp)
+	}
+}
+
+func TestConfigRejectsNegativeGraspDepth(t *testing.T) {
+	depth := -5.0
+	if _, _, err := (Config{GraspDepthMm: &depth}).Validate("code-1"); err == nil {
+		t.Fatal("negative grasp_depth_mm should be rejected")
+	}
+	zero := 0.0
+	if _, _, err := (Config{GraspDepthMm: &zero}).Validate("code-1"); err != nil {
+		t.Fatalf("grasp_depth_mm 0 should be allowed: %v", err)
+	}
+}

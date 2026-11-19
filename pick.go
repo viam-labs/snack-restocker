@@ -279,6 +279,9 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 		approachMm = v
 	}
 	graspDepthMm := defaultGraspDepthMm
+	if s.cfg.GraspDepthMm != nil {
+		graspDepthMm = *s.cfg.GraspDepthMm
+	}
 	if v, ok := cmd["grasp_depth_mm"].(float64); ok {
 		graspDepthMm = v
 	}
