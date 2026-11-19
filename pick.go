@@ -240,11 +240,16 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 	}
 
 	// Look at the bin from the first restock pose.
+	s.statusEvent("moving_to_view", "moving to "+pickViewSwitch, map[string]interface{}{
+		"target": nil, "attempts": 0, "last_refusal": nil, "snapshot_binary_data_id": nil, "snapshot_error": nil,
+	})
 	if err := s.goToPose(ctx, pickViewSwitch, next(), &steps); err != nil {
 		return nil, err
 	}
+	s.statusEvent("segmenting", "asking "+sam3VisionName+" for snack bags", nil)
 	scan, err := s.findSnacks(ctx)
 	if err != nil {
+		s.statusEvent("no_target", err.Error(), nil)
 		s.recordPick(ctx, scan, nil, "failed", nil)
 		return nil, err
 	}
@@ -256,6 +261,10 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 		}
 		targets = targets[:maxBags]
 	}
+	s.statusEvent("targets_found",
+		fmt.Sprintf("%d segments, %d plausible; trying the best %d", total, len(scan.targets), len(targets)),
+		map[string]interface{}{"candidates": total, "plausible": len(scan.targets), "rejected": rejected, "trying": len(targets)})
+	attemptCount := 0
 	var chosen *snackTarget
 	// fail records the snapshot for an error that ends the pick after the scan.
 	fail := func(err error) (map[string]interface{}, error) {
@@ -312,6 +321,7 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 		s.logger.Infof("pick: trying bag %d of %d, %q (confidence %.2f), center (%.0f, %.0f, %.0f) mm, top z %.0f mm",
 			i+1, len(targets), t.label, t.confidence, t.center.X, t.center.Y, t.center.Z, t.topZ)
 		for _, rotation := range gripperRotations {
+			bag := fmt.Sprintf("bag %d (%.2f) at rotation %.0f", i+1, t.confidence, rotation)
 			// A refused hover or descend is a planning failure: record it and
 			// try the next rotation or bag. The arm is left at the last pose
 			// it reached, and the next move plans from there.
@@ -319,6 +329,12 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 				s.logger.Infof("pick: bag %d rotation %.0f: %s refused: %v", i+1, rotation, stage, err)
 				scan.notes[t.index] = fmt.Sprintf("bag %d: %s refused", i+1, stage)
 				scan.failed[t.index] = true
+				attemptCount++
+				refusal := map[string]interface{}{
+					"bag": i + 1, "rotation_deg": rotation, "stage": stage, "error": err.Error(),
+				}
+				s.statusEvent(stage+"_refused", fmt.Sprintf("%s: %s refused: %v", bag, stage, err),
+					map[string]interface{}{"attempts": attemptCount, "last_refusal": refusal})
 				attempts = append(attempts, map[string]interface{}{
 					"bag":          i + 1,
 					"confidence":   t.confidence,
@@ -328,6 +344,10 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 					"error":        err.Error(),
 				})
 			}
+			s.statusEvent("hovering", "moving above "+bag, map[string]interface{}{"target": map[string]interface{}{
+				"bag": i + 1, "segment": t.index + 1, "label": t.label, "confidence": t.confidence,
+				"center_mm": vec(t.center), "top_z_mm": t.topZ, "rotation_deg": rotation,
+			}})
 			if err := s.moveTCP(ctx, "hover above snack", hover, rotation, nil, next(), &steps); err != nil {
 				if ctx.Err() != nil {
 					return fail(err)
@@ -339,6 +359,7 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 				selectBag(i+1, t, rotation, hover, grasp)
 				return finish("hovering"), nil
 			}
+			s.statusEvent("descending", "descending to "+bag, nil)
 			if err := s.moveTCP(ctx, "descend to snack", grasp, rotation, straightDown, next(), &steps); err != nil {
 				if ctx.Err() != nil {
 					return fail(err)
@@ -348,9 +369,11 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 			}
 			// At the bag: from here a failure is not retried.
 			selectBag(i+1, t, rotation, hover, grasp)
+			s.statusEvent("gripping", "closing gripper on "+bag, nil)
 			if err := s.setGripper(ctx, gripperClose, next(), &steps); err != nil {
 				return fail(err)
 			}
+			s.statusEvent("lifting", "lifting "+bag, nil)
 			if err := s.moveTCP(ctx, "lift snack", hover, rotation, straightDown, next(), &steps); err != nil {
 				return fail(err)
 			}
@@ -390,6 +413,7 @@ func (s *snackRestockerRestocker) runPickPlace(ctx context.Context, cmd map[stri
 	}
 
 	for r := 1; r <= rounds; r++ {
+		s.statusEvent("", "", map[string]interface{}{"round": r, "rounds": rounds, "rounds_completed": completed})
 		pick, err := s.runPick(ctx, cmd)
 		if err != nil {
 			return nil, fmt.Errorf("round %d pick: %w", r, err)
@@ -411,15 +435,19 @@ func (s *snackRestockerRestocker) runPickPlace(ctx context.Context, cmd map[stri
 			return step
 		}
 		for _, name := range placePoses {
+			s.statusEvent("placing", fmt.Sprintf("round %d: moving to %s", r, name), nil)
 			if err := s.goToPose(ctx, name, next(), &steps); err != nil {
 				return nil, fmt.Errorf("round %d place: %w", r, err)
 			}
 		}
+		s.statusEvent("dropping", fmt.Sprintf("round %d: opening gripper over the drawer", r), nil)
 		if err := s.setGripper(ctx, gripperOpen, next(), &steps); err != nil {
 			return nil, fmt.Errorf("round %d place: %w", r, err)
 		}
 		round["place_steps"] = steps
 		completed++
+		s.statusEvent("round_complete", fmt.Sprintf("round %d of %d placed", r, rounds),
+			map[string]interface{}{"rounds_completed": completed})
 	}
 	return finish("complete"), nil
 }
