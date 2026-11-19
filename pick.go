@@ -65,6 +65,8 @@ var straightDown = &motionplan.Constraints{
 
 // snackTarget is a plausible SAM3 segment, in the world frame.
 type snackTarget struct {
+	// index is the segment's position in sam3-vision's response.
+	index      int
 	label      string
 	confidence float64
 	center     r3.Vector
@@ -82,37 +84,54 @@ func vec(v r3.Vector) map[string]interface{} {
 	return map[string]interface{}{"x": v.X, "y": v.Y, "z": v.Z}
 }
 
+// sam3Scan is one look at the bin: the plausible bags, best-first, plus what
+// the per-pick snapshot needs.
+type sam3Scan struct {
+	targets []*snackTarget
+	total   int
+	// snapshotID names sam3-vision's saved frame and masks; empty if it has none.
+	snapshotID string
+	// notes is the snapshot label for each segment, by its index in the response.
+	notes map[int]string
+	// failed holds the indices of segments the arm tried and could not reach.
+	failed map[int]bool
+}
+
 // findSnacks asks sam3-vision for segments (sorted best-first) and returns
-// the ones that could be a real bag in the bin, in the same order, plus the
-// total number of segments.
-func (s *snackRestockerRestocker) findSnacks(ctx context.Context) ([]*snackTarget, int, error) {
+// the ones that could be a real bag in the bin, in the same order. The scan
+// is returned with the error when there are segments but none is plausible.
+func (s *snackRestockerRestocker) findSnacks(ctx context.Context) (*sam3Scan, error) {
 	resp, err := s.vision.DoCommand(ctx, map[string]interface{}{"command": "get_object_point_clouds"})
 	if err != nil {
-		return nil, 0, fmt.Errorf("%s get_object_point_clouds: %w", sam3VisionName, err)
+		return nil, fmt.Errorf("%s get_object_point_clouds: %w", sam3VisionName, err)
 	}
 	if msg, ok := resp["error"]; ok {
-		return nil, 0, fmt.Errorf("%s: %v", sam3VisionName, msg)
+		return nil, fmt.Errorf("%s: %v", sam3VisionName, msg)
 	}
 	objects, _ := resp["objects"].([]interface{})
+	snapshotID, _ := resp["snapshot_id"].(string)
+	scan := &sam3Scan{total: len(objects), snapshotID: snapshotID, notes: map[int]string{}, failed: map[int]bool{}}
 	if len(objects) == 0 {
-		return nil, 0, errors.New("no snack bags found")
+		return scan, errors.New("no snack bags found")
 	}
-	var targets []*snackTarget
 	var reasons []string
 	for i, raw := range objects {
 		target, reason := parseSnack(raw)
 		if target == nil {
 			s.logger.Debugf("pick: skipping segment %d: %s", i, reason)
 			reasons = append(reasons, reason)
+			scan.notes[i] = shortReason(reason)
 			continue
 		}
-		targets = append(targets, target)
+		target.index = i
+		scan.notes[i] = "not tried"
+		scan.targets = append(scan.targets, target)
 	}
-	if len(targets) == 0 {
-		return nil, len(objects), fmt.Errorf("none of the %d segments is a plausible bag in the bin; first rejection: %s",
+	if len(scan.targets) == 0 {
+		return scan, fmt.Errorf("none of the %d segments is a plausible bag in the bin; first rejection: %s",
 			len(objects), reasons[0])
 	}
-	return targets, len(objects), nil
+	return scan, nil
 }
 
 // parseSnack returns the target for one sam3 segment, or nil and the reason
@@ -224,13 +243,24 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 	if err := s.goToPose(ctx, pickViewSwitch, next(), &steps); err != nil {
 		return nil, err
 	}
-	targets, total, err := s.findSnacks(ctx)
+	scan, err := s.findSnacks(ctx)
 	if err != nil {
+		s.recordPick(ctx, scan, nil, "failed", nil)
 		return nil, err
 	}
+	targets, total := scan.targets, scan.total
 	rejected := total - len(targets)
 	if len(targets) > maxBags {
+		for _, t := range targets[maxBags:] {
+			scan.notes[t.index] = "not tried (max_bags)"
+		}
 		targets = targets[:maxBags]
+	}
+	var chosen *snackTarget
+	// fail records the snapshot for an error that ends the pick after the scan.
+	fail := func(err error) (map[string]interface{}, error) {
+		s.recordPick(ctx, scan, chosen, "error", nil)
+		return nil, err
 	}
 
 	attempts := []interface{}{}
@@ -244,6 +274,8 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 	// selectBag records the bag (1 = most confident plausible bag) and
 	// rotation used in the result.
 	selectBag := func(rank int, t *snackTarget, rotation float64, hover, grasp r3.Vector) {
+		chosen = t
+		scan.notes[t.index] = fmt.Sprintf("TARGET bag %d", rank)
 		result["bag"] = rank
 		result["label"] = t.label
 		result["confidence"] = t.confidence
@@ -258,6 +290,7 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 		result["attempts"] = attempts
 		result["steps"] = steps
 		result["steps_completed"] = step
+		s.recordPick(ctx, scan, chosen, status, result)
 		return result
 	}
 	posesFor := func(t *snackTarget) (r3.Vector, r3.Vector) {
@@ -272,7 +305,7 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 	}
 
 	if err := s.setGripper(ctx, gripperOpen, next(), &steps); err != nil {
-		return nil, err
+		return fail(err)
 	}
 	for i, t := range targets {
 		hover, grasp := posesFor(t)
@@ -284,6 +317,8 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 			// it reached, and the next move plans from there.
 			refused := func(stage string, err error) {
 				s.logger.Infof("pick: bag %d rotation %.0f: %s refused: %v", i+1, rotation, stage, err)
+				scan.notes[t.index] = fmt.Sprintf("bag %d: %s refused", i+1, stage)
+				scan.failed[t.index] = true
 				attempts = append(attempts, map[string]interface{}{
 					"bag":          i + 1,
 					"confidence":   t.confidence,
@@ -295,7 +330,7 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 			}
 			if err := s.moveTCP(ctx, "hover above snack", hover, rotation, nil, next(), &steps); err != nil {
 				if ctx.Err() != nil {
-					return nil, err
+					return fail(err)
 				}
 				refused("hover", err)
 				continue
@@ -306,7 +341,7 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 			}
 			if err := s.moveTCP(ctx, "descend to snack", grasp, rotation, straightDown, next(), &steps); err != nil {
 				if ctx.Err() != nil {
-					return nil, err
+					return fail(err)
 				}
 				refused("descend", err)
 				continue
@@ -314,10 +349,10 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 			// At the bag: from here a failure is not retried.
 			selectBag(i+1, t, rotation, hover, grasp)
 			if err := s.setGripper(ctx, gripperClose, next(), &steps); err != nil {
-				return nil, err
+				return fail(err)
 			}
 			if err := s.moveTCP(ctx, "lift snack", hover, rotation, straightDown, next(), &steps); err != nil {
-				return nil, err
+				return fail(err)
 			}
 			return finish("complete"), nil
 		}
