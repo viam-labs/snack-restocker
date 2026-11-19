@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"go.viam.com/rdk/app"
 	"go.viam.com/rdk/components/gripper"
 	toggleswitch "go.viam.com/rdk/components/switch"
 	"go.viam.com/rdk/logging"
@@ -163,6 +164,11 @@ type snackRestockerRestocker struct {
 	// Optional; nil when not on the machine. Used only by pick_snack.
 	vision vision.Service
 	motion motion.Service
+
+	// Per-pick snapshots; uploadSnapshot overrides the upload in tests.
+	uploadSnapshot snapshotUploader
+	viamClientMu   sync.Mutex
+	viamClient     *app.ViamClient
 
 	mu    sync.Mutex
 	state State
@@ -597,5 +603,6 @@ func (s *snackRestockerRestocker) Status(ctx context.Context) (map[string]interf
 
 func (s *snackRestockerRestocker) Close(context.Context) error {
 	s.cancelFunc()
+	s.closeDataClient()
 	return nil
 }
