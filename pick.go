@@ -66,13 +66,12 @@ const (
 )
 
 // Gripper rotations about the vertical to try for each bag, in degrees. 90
-// turns the claws parallel to a bin wall; 180 and 270 swing the wrist camera
-// to the other side, off a wall it would hit.
-var gripperRotations = []float64{0, 90, 180, 270}
+// turns the claws parallel to a bin wall the bag is lying against.
+var gripperRotations = []float64{0, 90}
 
-// Tilts off vertical, in degrees. Every rotation is tried straight down
-// before any tilt.
-var gripperTilts = []float64{0, 15, 20}
+// Tilt off vertical, in degrees, retried only for a rotation whose
+// straight-down hover was refused, after every rotation is tried straight down.
+const hoverFallbackTiltDeg = 15.0
 
 // graspAngle is one way to come at a bag.
 type graspAngle struct {
@@ -80,12 +79,10 @@ type graspAngle struct {
 	tiltDeg     float64
 }
 
-func graspAngles() []graspAngle {
-	angles := make([]graspAngle, 0, len(gripperTilts)*len(gripperRotations))
-	for _, tilt := range gripperTilts {
-		for _, rot := range gripperRotations {
-			angles = append(angles, graspAngle{rotationDeg: rot, tiltDeg: tilt})
-		}
+func straightDownAngles() []graspAngle {
+	angles := make([]graspAngle, 0, len(gripperRotations))
+	for _, rot := range gripperRotations {
+		angles = append(angles, graspAngle{rotationDeg: rot})
 	}
 	return angles
 }
@@ -267,7 +264,8 @@ func (s *snackRestockerRestocker) moveTCP(
 }
 
 // runPick runs pick_snack. It tries the plausible bags best-first, each at
-// every grasp angle, until one can be reached. dryRun stops after
+// every rotation straight down, then tilted where the hover was refused, until
+// one can be reached. dryRun stops after
 // finding the bags; hoverOnly stops above the first bag it can hover over.
 func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	if s.vision == nil || s.motion == nil {
@@ -371,7 +369,7 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 
 	if dryRun {
 		hover, grasp := posesFor(targets[0])
-		selectBag(1, targets[0], graspAngles()[0], hover, grasp)
+		selectBag(1, targets[0], straightDownAngles()[0], hover, grasp)
 		return finish("planned"), nil
 	}
 
@@ -382,7 +380,9 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 		hover, grasp := posesFor(t)
 		s.logger.Infof("pick: trying bag %d of %d, %q (confidence %.2f), center (%.0f, %.0f, %.0f) mm, top z %.0f mm",
 			i+1, len(targets), t.label, t.confidence, t.center.X, t.center.Y, t.center.Z, t.topZ)
-		for _, angle := range graspAngles() {
+		angles := straightDownAngles()
+		for k := 0; k < len(angles); k++ {
+			angle := angles[k]
 			bag := fmt.Sprintf("bag %d (%.2f) at rotation %.0f tilt %.0f", i+1, t.confidence, angle.rotationDeg, angle.tiltDeg)
 			// A refused hover or descend is a planning failure: record it and
 			// try the next angle or bag. The arm is left at the last pose
@@ -418,6 +418,9 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 					return fail(err)
 				}
 				refused("hover", err)
+				if angle.tiltDeg == 0 {
+					angles = append(angles, graspAngle{rotationDeg: angle.rotationDeg, tiltDeg: hoverFallbackTiltDeg})
+				}
 				continue
 			}
 			if hoverOnly {
@@ -445,8 +448,8 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 			return finish("complete"), nil
 		}
 	}
-	result["error"] = fmt.Sprintf("could not reach any of the %d plausible bags at rotations %v and tilts %v; see attempts",
-		len(targets), gripperRotations, gripperTilts)
+	result["error"] = fmt.Sprintf("could not reach any of the %d plausible bags at rotations %v; see attempts",
+		len(targets), gripperRotations)
 	return finish("failed"), nil
 }
 
