@@ -59,7 +59,7 @@ func TestPickAndPlaceRounds(t *testing.T) {
 
 func TestPickAndPlaceStopsWhenPickFails(t *testing.T) {
 	rig := withPlacePoses(newPickRig(t, twoBags()))
-	rig.refuse = func(_ r3.Vector, _ float64) bool { return true }
+	rig.refuse = func(_ r3.Vector, _ graspAngle) bool { return true }
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_and_place": true})
 	if resp["pick_and_place"] != "failed" || resp["rounds_completed"] != 0 || resp["error"] == nil {
 		t.Fatalf("pick_and_place: %v", resp)

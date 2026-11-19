@@ -27,9 +27,9 @@ func TestPickStatusIsLiveDuringThePick(t *testing.T) {
 	rig := newPickRig(t, twoBags())
 	var seen []map[string]interface{}
 	// The fake planner runs mid-pick, so it can read the status as a poller would.
-	rig.refuse = func(p r3.Vector, rotation float64) bool {
+	rig.refuse = func(p r3.Vector, a graspAngle) bool {
 		seen = append(seen, rig.s.pickStatusReport(false))
-		return p.Z == 80 // bag 1's descend is refused at both rotations
+		return p.Z == 80 // bag 1's descend is refused at every angle
 	}
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
 	if resp["pick_snack"] != "complete" || resp["bag"] != 2 {
@@ -43,7 +43,7 @@ func TestPickStatusIsLiveDuringThePick(t *testing.T) {
 	if target := first["target"].(map[string]interface{}); target["bag"] != 1 || target["confidence"] != 0.9 {
 		t.Fatalf("target before moving: %v", target)
 	}
-	// By bag 2's hover, bag 1's two refusals are already visible.
+	// By bag 2's hover, all of bag 1's refusals are already visible.
 	var bag2 map[string]interface{}
 	for _, st := range seen {
 		if target, _ := st["target"].(map[string]interface{}); target != nil && target["bag"] == 2 {
@@ -51,7 +51,7 @@ func TestPickStatusIsLiveDuringThePick(t *testing.T) {
 			break
 		}
 	}
-	if bag2 == nil || bag2["attempts"] != 2 || bag2["last_refusal"].(map[string]interface{})["stage"] != "descend" {
+	if bag2 == nil || bag2["attempts"] != len(graspAngles()) || bag2["last_refusal"].(map[string]interface{})["stage"] != "descend" {
 		t.Fatalf("refusals should show before the pick ends: %v", bag2)
 	}
 
@@ -59,11 +59,11 @@ func TestPickStatusIsLiveDuringThePick(t *testing.T) {
 	if final["phase"] != "complete" || final["running"] != false || final["command"] != "pick_snack" {
 		t.Fatalf("final status: %v", final)
 	}
-	want := []string{
-		"moving_to_view", "segmenting", "targets_found",
-		"hovering", "descending", "descend_refused", "hovering", "descending", "descend_refused",
-		"hovering", "descending", "gripping", "lifting", "complete",
+	want := []string{"moving_to_view", "segmenting", "targets_found"}
+	for range graspAngles() {
+		want = append(want, "hovering", "descending", "descend_refused")
 	}
+	want = append(want, "hovering", "descending", "gripping", "lifting", "complete")
 	got := phases(final)
 	if len(got) != len(want) {
 		t.Fatalf("events: %v", got)
@@ -89,7 +89,7 @@ func TestPickStatusWhenNothingIsFound(t *testing.T) {
 
 func TestPickStatusNewRunClearsTheOldOne(t *testing.T) {
 	rig := newPickRig(t, twoBags())
-	rig.refuse = func(p r3.Vector, rotation float64) bool { return p.Z < 100 }
+	rig.refuse = func(p r3.Vector, a graspAngle) bool { return p.Z < 100 }
 	rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
 	rig.refuse = nil
 	rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true, "dry_run": true})
