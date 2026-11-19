@@ -28,11 +28,14 @@ type pickRig struct {
 	refuse func(p r3.Vector, angle graspAngle) bool
 }
 
-// angleOf returns which of graspAngles a tool orientation at p uses.
+// angleOf returns which rotation, straight down or tilted, a tool orientation at p uses.
 func angleOf(p r3.Vector, o spatialmath.Orientation) (graspAngle, bool) {
-	for _, a := range graspAngles() {
-		if spatialmath.OrientationAlmostEqual(o, toolOrientation(p, a)) {
-			return a, true
+	for _, tilt := range []float64{0, hoverFallbackTiltDeg} {
+		for _, rot := range gripperRotations {
+			a := graspAngle{rotationDeg: rot, tiltDeg: tilt}
+			if spatialmath.OrientationAlmostEqual(o, toolOrientation(p, a)) {
+				return a, true
+			}
 		}
 	}
 	return graspAngle{}, false
@@ -270,7 +273,7 @@ func TestPickSnackRotatesWhenDescendIsRefused(t *testing.T) {
 	}
 }
 
-func TestPickSnackMovesToNextBagWhenEveryAngleFails(t *testing.T) {
+func TestPickSnackMovesToNextBagWhenBothRotationsFail(t *testing.T) {
 	rig := newPickRig(t, twoBags())
 	rig.refuse = func(p r3.Vector, a graspAngle) bool { return p.Z == 80 } // bag 1 unreachable
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
@@ -280,8 +283,8 @@ func TestPickSnackMovesToNextBagWhenEveryAngleFails(t *testing.T) {
 	if c := resp["center_mm"].(map[string]interface{}); c["x"] != 150.0 {
 		t.Fatalf("center: %v", c)
 	}
-	if n := len(resp["attempts"].([]interface{})); n != len(graspAngles()) {
-		t.Fatalf("every angle of bag 1 should be recorded: %v", resp["attempts"])
+	if n := len(resp["attempts"].([]interface{})); n != 2 {
+		t.Fatalf("both rotations of bag 1 should be recorded: %v", resp["attempts"])
 	}
 }
 
@@ -292,8 +295,8 @@ func TestPickSnackReportsAttemptsWhenNothingIsReachable(t *testing.T) {
 	if resp["pick_snack"] != "failed" || resp["error"] == nil {
 		t.Fatalf("should fail: %v", resp)
 	}
-	if n := len(resp["attempts"].([]interface{})); n != 2*len(graspAngles()) {
-		t.Fatalf("2 bags x every angle should be recorded: %v", resp["attempts"])
+	if n := len(resp["attempts"].([]interface{})); n != 4 {
+		t.Fatalf("2 bags x 2 rotations should be recorded: %v", resp["attempts"])
 	}
 	if len(rig.grips) != 1 || rig.grips[0] != gripperOpen {
 		t.Fatalf("gripper should only open: %v", rig.grips)
@@ -318,29 +321,6 @@ func TestPickSnackHoverOnlyRotatesWhenHoverIsRefused(t *testing.T) {
 	}
 }
 
-func TestPickSnackTiltsOnlyAfterEveryStraightDownRotation(t *testing.T) {
-	rig := newPickRig(t, twoBags())
-	rig.refuse = func(p r3.Vector, a graspAngle) bool { return a.tiltDeg == 0 }
-	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true, "hover_only": true})
-	if resp["pick_snack"] != "hovering" || resp["bag"] != 1 || resp["rotation_deg"] != 0.0 || resp["tilt_deg"] != 15.0 {
-		t.Fatalf("should hover over bag 1 tilted 15 after every straight-down rotation: %v", resp)
-	}
-	if n := len(resp["attempts"].([]interface{})); n != len(gripperRotations) {
-		t.Fatalf("every straight-down rotation should be refused first: %v", resp["attempts"])
-	}
-}
-
-func TestToolOrientationLeansWristTowardBinCenter(t *testing.T) {
-	nearLeftEdge := r3.Vector{X: 250, Y: -280, Z: 200}
-	o := toolOrientation(nearLeftEdge, graspAngle{tiltDeg: 20})
-	if o.OY <= 0 || math.Abs(o.OX) > 1e-9 {
-		t.Fatalf("tool should point toward the near wall so the wrist leans in: %+v", o)
-	}
-	if got := math.Acos(-o.OZ) * 180 / math.Pi; math.Abs(got-20) > 1e-6 {
-		t.Fatalf("tilt %v, want 20", got)
-	}
-}
-
 func TestHoverHeightIsCappedNearTheRim(t *testing.T) {
 	for _, tc := range []struct{ topZ, approach, want float64 }{
 		{100, 120, 220},                 // low bag: full approach
@@ -351,5 +331,81 @@ func TestHoverHeightIsCappedNearTheRim(t *testing.T) {
 		if got := hoverHeight(tc.topZ, tc.approach, defaultHoverAboveRimMm); got != tc.want {
 			t.Fatalf("hoverHeight(%v, %v) = %v, want %v", tc.topZ, tc.approach, got, tc.want)
 		}
+	}
+}
+
+// twoBags hovers at z=220 (bag 1) and z=210 (bag 2).
+func isHover(p r3.Vector) bool { return p.Z > 200 }
+
+func TestPickSnackTiltsTheHoverOnlyAfterEveryRotationStraightDown(t *testing.T) {
+	rig := newPickRig(t, twoBags())
+	rig.refuse = func(p r3.Vector, a graspAngle) bool { return isHover(p) && a.tiltDeg == 0 }
+	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
+	if resp["pick_snack"] != "complete" || resp["bag"] != 1 || resp["rotation_deg"] != 0.0 ||
+		resp["tilt_deg"] != hoverFallbackTiltDeg {
+		t.Fatalf("should grab bag 1 tilted at rotation 0: %v", resp)
+	}
+	attempts := resp["attempts"].([]interface{})
+	if len(attempts) != len(gripperRotations) {
+		t.Fatalf("every straight-down hover should be refused first: %v", attempts)
+	}
+	// Tilted hover, descend and lift all keep the tilt.
+	for i, tilt := range rig.tilts {
+		if tilt != hoverFallbackTiltDeg {
+			t.Fatalf("move %d tilt %v: %v", i, tilt, rig.tilts)
+		}
+	}
+}
+
+func TestPickSnackDoesNotTiltAfterARefusedDescend(t *testing.T) {
+	rig := newPickRig(t, twoBags())
+	rig.refuse = func(p r3.Vector, a graspAngle) bool { return p.Z == 80 } // bag 1's descend, every rotation
+	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
+	if resp["pick_snack"] != "complete" || resp["bag"] != 2 {
+		t.Fatalf("should move on to bag 2: %v", resp)
+	}
+	for _, raw := range resp["attempts"].([]interface{}) {
+		if a := raw.(map[string]interface{}); a["tilt_deg"] != 0.0 {
+			t.Fatalf("a refused descend should not be retried tilted: %v", resp["attempts"])
+		}
+	}
+	for _, tilt := range rig.tilts {
+		if tilt != 0 {
+			t.Fatalf("no move should be tilted: %v", rig.tilts)
+		}
+	}
+}
+
+func TestPickSnackTriesTiltedHoversBeforeTheNextBag(t *testing.T) {
+	rig := newPickRig(t, twoBags())
+	rig.refuse = func(p r3.Vector, a graspAngle) bool { return math.Abs(p.Z-220) < 1 } // bag 1's hover, every angle
+	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
+	if resp["pick_snack"] != "complete" || resp["bag"] != 2 || resp["tilt_deg"] != 0.0 {
+		t.Fatalf("should grab bag 2 straight down: %v", resp)
+	}
+	var tried []graspAngle
+	for _, raw := range resp["attempts"].([]interface{}) {
+		a := raw.(map[string]interface{})
+		tried = append(tried, graspAngle{rotationDeg: a["rotation_deg"].(float64), tiltDeg: a["tilt_deg"].(float64)})
+	}
+	want := []graspAngle{{0, 0}, {90, 0}, {0, hoverFallbackTiltDeg}, {90, hoverFallbackTiltDeg}}
+	if len(tried) != len(want) {
+		t.Fatalf("bag 1 attempts %v, want %v", tried, want)
+	}
+	for i := range want {
+		if tried[i] != want[i] {
+			t.Fatalf("bag 1 attempts %v, want %v", tried, want)
+		}
+	}
+}
+
+func TestToolOrientationLeansWristTowardBinCenter(t *testing.T) {
+	nearLeftEdge := r3.Vector{X: 250, Y: -280, Z: 200}
+	o := toolOrientation(nearLeftEdge, graspAngle{tiltDeg: hoverFallbackTiltDeg})
+	if o.OY <= 0 || math.Abs(o.OX) > 1e-9 {
+		t.Fatalf("tool should point toward the near wall so the wrist leans in: %+v", o)
+	}
+	if got := math.Acos(-o.OZ) * 180 / math.Pi; math.Abs(got-hoverFallbackTiltDeg) > 1e-6 {
+		t.Fatalf("tilt %v, want %v", got, hoverFallbackTiltDeg)
 	}
 }
