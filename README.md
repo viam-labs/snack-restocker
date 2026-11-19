@@ -7,6 +7,7 @@ Drives an arm and gripper through a full snack restock: open the drawer, pick up
 This module provides the following model(s):
 
 - [`viam:snack-restocker:restocker`](viam_snack-restocker_restocker.md) - Generic service that runs the restock sequence and exposes its state machine through DoCommand.
+- `viam:snack-restocker:pick-status` - Sensor whose readings are a restocker's live `pick_snack` / `pick_and_place` status (see [`get_pick_status`](#get_pick_status)).
 
 ## Configuration
 
@@ -173,11 +174,11 @@ The steps:
 
    Segments that fail these checks come from bad depth readings, such as far-away background pixels inside a mask. They are skipped and counted in `rejected`. If none pass, the command fails without moving toward a bag.
 3. Open the gripper.
-4. For each plausible bag, most confident first (up to `max_bags`), and for each gripper rotation (0°, then 90° about the vertical):
-   1. Move `gripper-tcp`, pointing straight down, to `approach_mm` above the top of the bag.
+4. For each plausible bag, most confident first (up to `max_bags`), and for each grasp angle: first pointing straight down at rotations 0°, 90°, 180° and 270° about the vertical, then the same four rotations tilted 15°, then 20°:
+   1. Move `gripper-tcp` to the hover point above the bag: `approach_mm` above its top, but no higher than `hover_above_rim_mm` above the bin rim (z = 360 mm), and always at least 30 mm above the top of the bag.
    2. Descend in a straight line to `grasp_depth_mm` below the top of the bag.
 
-   If the motion planner refuses the hover or the descend, for example because the open claws would hit a bin wall, the refusal is recorded in `attempts` and it tries the next rotation, then the next bag. A rotation of 90° turns the claws parallel to a wall the bag is lying against. The arm stays at the last pose it reached, and the next move is planned from there.
+   If the motion planner refuses the hover or the descend, the refusal is recorded in `attempts` and it tries the next angle, then the next bag. 90° turns the claws parallel to a wall the bag is lying against; 180° and 270° swing the wrist camera to the other side, off a wall it would hit. A tilt points the tool away from the bin center, so the wrist leans in toward the middle of the bin: off the nearest wall, and closer to the arm base for bags on the far side. The arm stays at the last pose it reached, and the next move is planned from there.
 5. Once at a bag: close the gripper (30), then lift straight back up to the hover point. A failure here is not retried.
 
 The arm stays at the hover point holding the bag.
@@ -186,9 +187,10 @@ Optional fields:
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `dry_run` | `false` | Go to `restock-1-find` and find the bags, but do not open the gripper or move toward a bag. Returns the poses for the most confident plausible bag at rotation 0. |
+| `dry_run` | `false` | Go to `restock-1-find` and find the bags, but do not open the gripper or move toward a bag. Returns the poses for the most confident plausible bag, pointing straight down at rotation 0. |
 | `hover_only` | `false` | Stop at the first hover point it can reach, with the gripper open. |
-| `approach_mm` | `120` | Height of the hover point above the top of the bag. |
+| `approach_mm` | `120` | Height of the hover point above the top of the bag, before the rim cap. |
+| `hover_above_rim_mm` | `50` | Highest hover point, above the bin rim. A high hover far from the arm base has no straight-down IK solution. |
 | `grasp_depth_mm` | `20` | How far below the top of the bag the gripper closes. |
 | `max_bags` | `3` | How many plausible bags to try before giving up. |
 
@@ -203,6 +205,7 @@ On success:
   "label": "snack bag",
   "confidence": 0.93,
   "rotation_deg": 90,
+  "tilt_deg": 0,
   "candidates": 27,
   "rejected": 4,
   "plausible": 3,
@@ -216,6 +219,7 @@ On success:
       "confidence": 0.93,
       "center_mm": { "x": 121, "y": -419, "z": 181 },
       "rotation_deg": 0,
+      "tilt_deg": 0,
       "stage": "descend",
       "error": "descend to snack: ... violation between bin:bin-left and gripper:claws ..."
     }
@@ -225,7 +229,7 @@ On success:
 }
 ```
 
-- `bag` is the rank of the bag it grabbed among the plausible bags (1 = most confident). `rotation_deg` is the gripper rotation it used.
+- `bag` is the rank of the bag it grabbed among the plausible bags (1 = most confident). `rotation_deg` and `tilt_deg` are the gripper rotation and tilt it used.
 - `candidates` is the number of SAM3 segments, `rejected` how many failed the plausibility checks, and `plausible` how many bags it would try (at most `max_bags`).
 - `attempts` lists every refused hover or descend.
 
@@ -251,6 +255,47 @@ It stops at the first round whose pick doesn't complete, without going to the dr
   "results": [{ "round": 1, "pick": { "pick_snack": "complete", "...": "..." }, "place_steps": ["..."] }, "..."]
 }
 ```
+
+### `get_pick_status`
+
+Returns the live status of the current or last `pick_snack` / `pick_and_place` run. It answers while a pick is still moving the arm, so you can poll it to see the target before the arm reaches it and each refused move as it happens:
+
+```json
+{ "get_pick_status": true }
+```
+
+```json
+{
+  "run": 3,
+  "command": "pick_snack",
+  "running": true,
+  "phase": "hovering",
+  "message": "moving above bag 2 (0.95) at rotation 0 tilt 0",
+  "seconds_in_phase": 1.4,
+  "candidates": 28, "plausible": 22, "rejected": 6, "trying": 3,
+  "target": { "bag": 2, "segment": 2, "confidence": 0.95, "center_mm": { "x": 250, "y": -314, "z": 157 }, "top_z_mm": 190, "rotation_deg": 0, "tilt_deg": 0, "label": "snack bag" },
+  "attempts": 2,
+  "last_refusal": { "bag": 1, "rotation_deg": 90, "tilt_deg": 0, "stage": "hover", "error": "..." },
+  "events": [{ "at": "2026-11-19T19:02:11.4Z", "phase": "moving_to_view", "message": "moving to restock-1-find" }, "..."]
+}
+```
+
+Phases, in order: `moving_to_view`, `segmenting`, `targets_found` (or `no_target`), then per try `hovering`, `descending`, `hover_refused` / `descend_refused`, `gripping`, `lifting`; for `pick_and_place` also `placing`, `dropping`, `round_complete` (with `round`, `rounds`, `rounds_completed`). The run ends in the command's final status (`complete`, `planned`, `hovering`, `failed`) with `running: false`, and the snapshot fields (`snapshot_binary_data_id` or `snapshot_error`) once uploaded. `events` keeps the last 50 phase changes. A new run replaces the previous one's status.
+
+### `pick-status` sensor
+
+To see the status in the CONTROL tab, capture it to data, or set triggers on it, add a sensor that reads it:
+
+```json
+{
+  "name": "pick-status",
+  "api": "rdk:component:sensor",
+  "model": "viam:snack-restocker:pick-status",
+  "attributes": { "restocker": "code-1" }
+}
+```
+
+`Readings` returns `get_pick_status` without `events`, so each captured reading stays small. Configure data capture on its `Readings` (for example at 2 Hz) to keep a history of every pick in DATA.
 
 ### Unknown commands
 

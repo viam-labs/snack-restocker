@@ -54,6 +54,7 @@ func (s *snackRestockerRestocker) recordPick(
 		if result != nil {
 			result[k] = v
 		}
+		s.statusEvent("", "", map[string]interface{}{k: v})
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotTimeout)
 	defer cancel()

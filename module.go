@@ -170,6 +170,8 @@ type snackRestockerRestocker struct {
 	viamClientMu   sync.Mutex
 	viamClient     *app.ViamClient
 
+	pickStatus pickStatus
+
 	mu    sync.Mutex
 	state State
 
@@ -523,21 +525,31 @@ func (s *snackRestockerRestocker) DoCommand(ctx context.Context, cmd map[string]
 	}
 
 	if pick, _ := cmd["pick_snack"].(bool); pick {
+		s.statusStart("pick_snack")
 		result, err := s.runPick(ctx, cmd)
 		if err != nil {
 			s.logger.Errorf("pick_snack failed: %v", err)
+			s.statusFinish("failed", err.Error())
 			return map[string]interface{}{"pick_snack": "failed", "error": err.Error()}, nil
 		}
+		s.finishFromResult(result, "pick_snack")
 		return result, nil
 	}
 
 	if place, _ := cmd["pick_and_place"].(bool); place {
+		s.statusStart("pick_and_place")
 		result, err := s.runPickPlace(ctx, cmd)
 		if err != nil {
 			s.logger.Errorf("pick_and_place failed: %v", err)
+			s.statusFinish("failed", err.Error())
 			return map[string]interface{}{"pick_and_place": "failed", "error": err.Error()}, nil
 		}
+		s.finishFromResult(result, "pick_and_place")
 		return result, nil
+	}
+
+	if _, ok := cmd["get_pick_status"]; ok {
+		return s.pickStatusReport(true), nil
 	}
 
 	if _, ok := cmd["get_state"]; ok {
@@ -591,7 +603,7 @@ func (s *snackRestockerRestocker) DoCommand(ctx context.Context, cmd map[string]
 			`{"advance_state": true} to step to the next state, ` +
 			`{"set_state": "<state>", "force": false} to set a state, ` +
 			`or {"reset_state": true} to return to idle`,
-		"supported_commands": []interface{}{"restock", "restock_fixture", "pick_snack", "pick_and_place", "get_state", "advance_state", "set_state", "reset_state"},
+		"supported_commands": []interface{}{"restock", "restock_fixture", "pick_snack", "pick_and_place", "get_pick_status", "get_state", "advance_state", "set_state", "reset_state"},
 		"states":             stateStrings(stateSequence),
 		"state":              string(s.currentState()),
 	}, nil

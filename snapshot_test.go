@@ -62,7 +62,7 @@ func (r *snapshotRig) onlyRender(t *testing.T) map[string]interface{} {
 
 func TestPickSnapshotHighlightsTheBagActuallyGrabbed(t *testing.T) {
 	rig := newSnapshotRig(t, twoBags(), nil)
-	rig.refuse = func(p r3.Vector, rotation float64) bool { return p.Z == 80 } // bag 1 unreachable
+	rig.refuse = func(p r3.Vector, a graspAngle) bool { return p.Z == 80 } // bag 1 unreachable
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
 	if resp["pick_snack"] != "complete" || resp["bag"] != 2 {
 		t.Fatalf("pick: %v", resp)
@@ -162,7 +162,7 @@ func TestPickSnapshotOnEveryPickAndPlaceRound(t *testing.T) {
 
 func TestPickSnapshotBagGrabbedAfterARefusedRotationIsNotFailed(t *testing.T) {
 	rig := newSnapshotRig(t, twoBags(), nil)
-	rig.refuse = func(p r3.Vector, rotation float64) bool { return p.Z == 80 && rotation == 0 }
+	rig.refuse = func(p r3.Vector, a graspAngle) bool { return p.Z == 80 && a.rotationDeg == 0 }
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
 	if resp["pick_snack"] != "complete" || resp["bag"] != 1 {
 		t.Fatalf("pick: %v", resp)
@@ -178,7 +178,7 @@ func TestPickSnapshotBagGrabbedAfterARefusedRotationIsNotFailed(t *testing.T) {
 
 func TestPickSnapshotAllTriedBagsFailed(t *testing.T) {
 	rig := newSnapshotRig(t, twoBags(), nil)
-	rig.refuse = func(p r3.Vector, rotation float64) bool { return p.Z > 150 } // every hover
+	rig.refuse = func(p r3.Vector, a graspAngle) bool { return p.Z > 150 } // every hover
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
 	if resp["pick_snack"] != "failed" {
 		t.Fatalf("pick: %v", resp)
