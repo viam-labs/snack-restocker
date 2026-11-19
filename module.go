@@ -124,14 +124,21 @@ func init() {
 	)
 }
 
-// Config has no attributes; the gripper and switch names are fixed above.
-type Config struct{}
+// Config holds optional pick_snack defaults; the gripper and switch names are fixed above.
+type Config struct {
+	// GraspDepthMm is how far below the top of the bag the gripper closes.
+	// Unset uses defaultGraspDepthMm; a pick_snack "grasp_depth_mm" overrides it.
+	GraspDepthMm *float64 `json:"grasp_depth_mm,omitempty"`
+}
 
 // Validate requires the gripper and every pose-saver switch used by the
 // restock sequence. The fixture-teacher drawer services and the SAM3 vision
 // and motion services are optional; only restock_fixture and pick_snack use
 // them.
 func (cfg Config) Validate(path string) ([]string, []string, error) {
+	if cfg.GraspDepthMm != nil && *cfg.GraspDepthMm < 0 {
+		return nil, nil, fmt.Errorf("%s: grasp_depth_mm must be 0 or more, got %v", path, *cfg.GraspDepthMm)
+	}
 	optional := []string{drawerOpenerName, drawerCloserName, sam3VisionName, motionName}
 	return append([]string{gripperName}, allSwitches()...), optional, nil
 }
