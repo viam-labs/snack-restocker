@@ -326,3 +326,65 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 		len(targets), gripperRotations)
 	return finish("failed"), nil
 }
+
+// Poses pick_and_place carries a picked bag through before releasing it over
+// the drawer: the same drop poses the restock sequence uses.
+var placePoses = []string{"restock-4-view-drawer", "restock-5-drop"}
+
+// How many pick-then-place rounds pick_and_place runs, by default.
+const defaultPlaceRounds = 2
+
+// runPickPlace runs pick_and_place: rounds of pick_snack, each followed by
+// moving the bag through placePoses and opening the gripper to drop it. It
+// takes the same options as pick_snack plus "rounds". It stops at the first
+// round whose pick does not complete, including a dry_run or hover_only pick.
+func (s *snackRestockerRestocker) runPickPlace(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+	rounds := defaultPlaceRounds
+	if v, ok := cmd["rounds"].(float64); ok && v >= 1 {
+		rounds = int(v)
+	}
+	results := []interface{}{}
+	completed := 0
+	finish := func(status string) map[string]interface{} {
+		return map[string]interface{}{
+			"pick_and_place":   status,
+			"rounds":           rounds,
+			"rounds_completed": completed,
+			"results":          results,
+		}
+	}
+
+	for r := 1; r <= rounds; r++ {
+		pick, err := s.runPick(ctx, cmd)
+		if err != nil {
+			return nil, fmt.Errorf("round %d pick: %w", r, err)
+		}
+		round := map[string]interface{}{"round": r, "pick": pick}
+		results = append(results, round)
+		if status, _ := pick["pick_snack"].(string); status != "complete" {
+			result := finish(status)
+			if status == "failed" {
+				result["error"] = fmt.Sprintf("round %d pick failed: %v", r, pick["error"])
+			}
+			return result, nil
+		}
+
+		steps := []interface{}{}
+		step := 0
+		next := func() int {
+			step++
+			return step
+		}
+		for _, name := range placePoses {
+			if err := s.goToPose(ctx, name, next(), &steps); err != nil {
+				return nil, fmt.Errorf("round %d place: %w", r, err)
+			}
+		}
+		if err := s.setGripper(ctx, gripperOpen, next(), &steps); err != nil {
+			return nil, fmt.Errorf("round %d place: %w", r, err)
+		}
+		round["place_steps"] = steps
+		completed++
+	}
+	return finish("complete"), nil
+}

@@ -525,6 +525,15 @@ func (s *snackRestockerRestocker) DoCommand(ctx context.Context, cmd map[string]
 		return result, nil
 	}
 
+	if place, _ := cmd["pick_and_place"].(bool); place {
+		result, err := s.runPickPlace(ctx, cmd)
+		if err != nil {
+			s.logger.Errorf("pick_and_place failed: %v", err)
+			return map[string]interface{}{"pick_and_place": "failed", "error": err.Error()}, nil
+		}
+		return result, nil
+	}
+
 	if _, ok := cmd["get_state"]; ok {
 		return s.stateReport(nil), nil
 	}
@@ -572,10 +581,11 @@ func (s *snackRestockerRestocker) DoCommand(ctx context.Context, cmd map[string]
 			`{"restock_fixture": true} to run it with the drawer-open and draw-closer services, ` +
 			`{"get_state": true} to read the state machine, ` +
 			`{"pick_snack": true} to grab the best SAM3 snack bag, ` +
+			`{"pick_and_place": true} to pick a SAM3 snack bag and drop it over the drawer, twice, ` +
 			`{"advance_state": true} to step to the next state, ` +
 			`{"set_state": "<state>", "force": false} to set a state, ` +
 			`or {"reset_state": true} to return to idle`,
-		"supported_commands": []interface{}{"restock", "restock_fixture", "pick_snack", "get_state", "advance_state", "set_state", "reset_state"},
+		"supported_commands": []interface{}{"restock", "restock_fixture", "pick_snack", "pick_and_place", "get_state", "advance_state", "set_state", "reset_state"},
 		"states":             stateStrings(stateSequence),
 		"state":              string(s.currentState()),
 	}, nil
