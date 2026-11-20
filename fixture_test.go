@@ -37,7 +37,7 @@ func newFakeRestocker(t *testing.T, openResp, closeResp map[string]interface{}) 
 	fixture := func(name string, resp map[string]interface{}) *inject.GenericService {
 		svc := inject.NewGenericService(name)
 		svc.DoFunc = func(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
-			if cmd["cmd"] != "run" {
+			if cmd["cmd"] != "run" || cmd["speed_degs_per_sec"] != fixtureSpeedDegsPerSec {
 				t.Fatalf("%s: unexpected command %v", name, cmd)
 			}
 			calls = append(calls, fmt.Sprintf("%s:%v", name, cmd["motion"]))

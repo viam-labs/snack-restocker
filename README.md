@@ -115,10 +115,10 @@ Runs the same restock sequence as `restock`, except the drawer is opened and clo
 | State | What happens |
 |-------|--------------|
 | `finding_drawer` | Close the gripper fully. `drawer-open` moves to its own view pose to find the drawer. |
-| `opening_drawer` | `drawer-open`: `{"cmd": "run", "motion": "open"}`. |
+| `opening_drawer` | `drawer-open`: `{"cmd": "run", "motion": "open", "speed_degs_per_sec": 30}`. |
 | `picking_up_snack` | Same as `restock`. |
 | `restocking` | Same as `restock`. |
-| `closing_drawer` | `draw-closer`: `{"cmd": "run", "motion": "close"}`, then go to `open-drawer-0-position`. |
+| `closing_drawer` | `draw-closer`: `{"cmd": "run", "motion": "close", "speed_degs_per_sec": 30}`, then go to `open-drawer-0-position`. |
 
 It uses the same state machine and returns the same shape as `restock`, under a `restock_fixture` key. If a drawer motion reports an `error`, the sequence stops there, the state resets to `idle`, and it returns `{"restock_fixture": "failed", "error": "<reason>", "state": "idle"}`.
 
