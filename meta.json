@@ -2,7 +2,7 @@
   "$schema": "https://dl.viam.dev/module.schema.json",
   "module_id": "viam:snack-restocker",
   "visibility": "public",
-  "url": "",
+  "url": "https://github.com/viam-labs/snack-restocker",
   "description": "Modular generic service: restocker",
   "applications": null,
   "markdown_link": "README.md",
