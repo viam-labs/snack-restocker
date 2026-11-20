@@ -16,7 +16,7 @@ func phases(report map[string]interface{}) []string {
 }
 
 func TestPickStatusBeforeAnyPick(t *testing.T) {
-	rig := newPickRig(t, twoBags())
+	rig := newPickRig(t, twoBags(t))
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"get_pick_status": true})
 	if resp["phase"] != "none" || resp["running"] != false {
 		t.Fatalf("status: %v", resp)
@@ -24,7 +24,7 @@ func TestPickStatusBeforeAnyPick(t *testing.T) {
 }
 
 func TestPickStatusIsLiveDuringThePick(t *testing.T) {
-	rig := newPickRig(t, twoBags())
+	rig := newPickRig(t, twoBags(t))
 	var seen []map[string]interface{}
 	// The fake planner runs mid-pick, so it can read the status as a poller would.
 	rig.refuse = func(p r3.Vector, a graspAngle) bool {
@@ -76,7 +76,7 @@ func TestPickStatusIsLiveDuringThePick(t *testing.T) {
 }
 
 func TestPickStatusWhenNothingIsFound(t *testing.T) {
-	rig := newPickRig(t, map[string]interface{}{"objects": []interface{}{}})
+	rig := newPickRig(t, nil)
 	rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
 	st := rig.s.pickStatusReport(true)
 	if st["phase"] != "failed" || st["running"] != false || st["message"] != "no snack bags found" {
@@ -88,7 +88,7 @@ func TestPickStatusWhenNothingIsFound(t *testing.T) {
 }
 
 func TestPickStatusNewRunClearsTheOldOne(t *testing.T) {
-	rig := newPickRig(t, twoBags())
+	rig := newPickRig(t, twoBags(t))
 	rig.refuse = func(p r3.Vector, a graspAngle) bool { return p.Z < 100 }
 	rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
 	rig.refuse = nil
@@ -100,7 +100,7 @@ func TestPickStatusNewRunClearsTheOldOne(t *testing.T) {
 }
 
 func TestPickAndPlaceStatusTracksRounds(t *testing.T) {
-	rig := withPlacePoses(newPickRig(t, twoBags()))
+	rig := withPlacePoses(newPickRig(t, twoBags(t)))
 	rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_and_place": true})
 	st := rig.s.pickStatusReport(true)
 	if st["command"] != "pick_and_place" || st["phase"] != "complete" || st["rounds_completed"] != 2 || st["round"] != 2 {
@@ -117,7 +117,7 @@ func TestPickAndPlaceStatusTracksRounds(t *testing.T) {
 }
 
 func TestPickStatusSensorReadings(t *testing.T) {
-	rig := newPickRig(t, twoBags())
+	rig := newPickRig(t, twoBags(t))
 	rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true, "dry_run": true})
 	sensor := &pickStatusSensor{restocker: rig.s}
 	readings, err := sensor.Readings(context.Background(), nil)

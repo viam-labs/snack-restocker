@@ -7,10 +7,13 @@ import (
 	"math"
 
 	"github.com/golang/geo/r3"
+	"github.com/google/uuid"
 	"go.viam.com/rdk/motionplan"
+	"go.viam.com/rdk/pointcloud"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/services/motion"
 	"go.viam.com/rdk/spatialmath"
+	"go.viam.com/rdk/vision/detection3d"
 )
 
 // Vision-guided pick: a standalone DoCommand, separate from the restock
@@ -103,6 +106,8 @@ type snackTarget struct {
 	confidence float64
 	center     r3.Vector
 	topZ       float64
+	// cloud is the segment's points in the world frame.
+	cloud pointcloud.PointCloud
 }
 
 // toolOrientation points the tool down (-Z in world), rotated about the
@@ -151,26 +156,23 @@ type sam3Scan struct {
 	failed map[int]bool
 }
 
-// findSnacks asks sam3-vision for segments (sorted best-first) and returns
-// the ones that could be a real bag in the bin, in the same order. The scan
-// is returned with the error when there are segments but none is plausible.
+// findSnacks asks sam3-vision for 3D detections (sorted best-first) and
+// returns the ones that could be a real bag in the bin, in the same order. The
+// scan is returned with the error when there are segments but none is plausible.
 func (s *snackRestockerRestocker) findSnacks(ctx context.Context) (*sam3Scan, error) {
-	resp, err := s.vision.DoCommand(ctx, map[string]interface{}{"command": "get_object_point_clouds"})
+	// sam3-vision keeps the frame under this ID for render_pick, even when it finds nothing.
+	snapshotID := uuid.NewString()
+	dets, err := s.vision.GetDetections3D(ctx, "", map[string]interface{}{"snapshot_id": snapshotID})
 	if err != nil {
-		return nil, fmt.Errorf("%s get_object_point_clouds: %w", sam3VisionName, err)
+		return nil, fmt.Errorf("%s GetDetections3D: %w", sam3VisionName, err)
 	}
-	if msg, ok := resp["error"]; ok {
-		return nil, fmt.Errorf("%s: %v", sam3VisionName, msg)
-	}
-	objects, _ := resp["objects"].([]interface{})
-	snapshotID, _ := resp["snapshot_id"].(string)
-	scan := &sam3Scan{total: len(objects), snapshotID: snapshotID, notes: map[int]string{}, failed: map[int]bool{}}
-	if len(objects) == 0 {
+	scan := &sam3Scan{total: len(dets), snapshotID: snapshotID, notes: map[int]string{}, failed: map[int]bool{}}
+	if len(dets) == 0 {
 		return scan, errors.New("no snack bags found")
 	}
 	var reasons []string
-	for i, raw := range objects {
-		target, reason := parseSnack(raw)
+	for i, det := range dets {
+		target, reason := parseSnack(det)
 		if target == nil {
 			s.logger.Debugf("pick: skipping segment %d: %s", i, reason)
 			reasons = append(reasons, reason)
@@ -183,33 +185,31 @@ func (s *snackRestockerRestocker) findSnacks(ctx context.Context) (*sam3Scan, er
 	}
 	if len(scan.targets) == 0 {
 		return scan, fmt.Errorf("none of the %d segments is a plausible bag in the bin; first rejection: %s",
-			len(objects), reasons[0])
+			len(dets), reasons[0])
 	}
 	return scan, nil
 }
 
-// parseSnack returns the target for one sam3 segment, or nil and the reason
-// it is not a plausible bag in the bin.
-func parseSnack(raw interface{}) (*snackTarget, string) {
-	obj, ok := raw.(map[string]interface{})
-	if !ok {
-		return nil, fmt.Sprintf("unexpected object %v", raw)
-	}
-	if frame := fmt.Sprint(obj["reference_frame"]); frame != referenceframe.World {
-		return nil, fmt.Sprintf("frame %q is not world; check the camera's frame config", frame)
-	}
-	center, err := readVec(obj["center_mm"])
+// parseSnack returns the target for one 3D detection, or nil and the reason
+// it is not a plausible bag in the bin. The bag's center, size and top come
+// from the axis-aligned bounds of its points in the world frame.
+func parseSnack(det *detection3d.Detection) (*snackTarget, string) {
+	cloud, err := worldCloud(det)
 	if err != nil {
-		return nil, "center_mm: " + err.Error()
+		return nil, err.Error()
 	}
-	dims, err := readVec(obj["dims_mm"])
-	if err != nil {
-		return nil, "dims_mm: " + err.Error()
+	if cloud.Size() == 0 {
+		return nil, "no points"
 	}
-	maxes, err := readVec(obj["max_mm"])
-	if err != nil {
-		return nil, "max_mm: " + err.Error()
-	}
+	minPt := r3.Vector{X: math.Inf(1), Y: math.Inf(1), Z: math.Inf(1)}
+	maxPt := r3.Vector{X: math.Inf(-1), Y: math.Inf(-1), Z: math.Inf(-1)}
+	cloud.Iterate(0, 0, func(p r3.Vector, _ pointcloud.Data) bool {
+		minPt = r3.Vector{X: math.Min(minPt.X, p.X), Y: math.Min(minPt.Y, p.Y), Z: math.Min(minPt.Z, p.Z)}
+		maxPt = r3.Vector{X: math.Max(maxPt.X, p.X), Y: math.Max(maxPt.Y, p.Y), Z: math.Max(maxPt.Z, p.Z)}
+		return true
+	})
+	center := minPt.Add(maxPt).Mul(0.5)
+	dims := maxPt.Sub(minPt)
 	if center.X < binMin.X || center.X > binMax.X || center.Y < binMin.Y || center.Y > binMax.Y ||
 		center.Z < binMin.Z || center.Z > binMax.Z {
 		return nil, fmt.Sprintf("center (%.0f, %.0f, %.0f) is outside the bin", center.X, center.Y, center.Z)
@@ -217,27 +217,44 @@ func parseSnack(raw interface{}) (*snackTarget, string) {
 	if size := math.Max(dims.X, math.Max(dims.Y, dims.Z)); size < minBagSizeMm || size > maxBagSizeMm {
 		return nil, fmt.Sprintf("largest side %.0f mm is not bag-sized (%.0f-%.0f mm)", size, minBagSizeMm, maxBagSizeMm)
 	}
-	confidence, _ := obj["confidence"].(float64)
-	return &snackTarget{
-		label:      fmt.Sprint(obj["label"]),
-		confidence: confidence,
-		center:     center,
-		topZ:       maxes.Z,
-	}, ""
+	target := &snackTarget{center: center, topZ: maxPt.Z, cloud: cloud}
+	if len(det.Classifications) > 0 {
+		target.label = det.Classifications[0].Label()
+		target.confidence = det.Classifications[0].Score()
+	}
+	return target, ""
 }
 
-func readVec(v interface{}) (r3.Vector, error) {
-	m, ok := v.(map[string]interface{})
-	if !ok {
-		return r3.Vector{}, fmt.Errorf("expected {x, y, z}, got %v", v)
+// worldCloud returns the points carried by a child of det's root frame, moved
+// into the world frame. The root must be parented to world.
+func worldCloud(det *detection3d.Detection) (pointcloud.PointCloud, error) {
+	if len(det.Transforms) == 0 {
+		return nil, errors.New("detection has no frames")
 	}
-	x, okX := m["x"].(float64)
-	y, okY := m["y"].(float64)
-	z, okZ := m["z"].(float64)
-	if !okX || !okY || !okZ {
-		return r3.Vector{}, fmt.Errorf("expected numeric x, y, z, got %v", m)
+	root := det.Transforms[0]
+	if frame := root.Parent(); frame != referenceframe.World {
+		return nil, fmt.Errorf("frame %q is not world; check the camera's frame config", frame)
 	}
-	return r3.Vector{X: x, Y: y, Z: z}, nil
+	for _, link := range det.Transforms[1:] {
+		points, ok := link.Geometry().(pointcloud.PointCloud)
+		if !ok || link.Parent() != root.Name() {
+			continue
+		}
+		pose := spatialmath.Compose(root.Pose(), link.Pose())
+		rot := pose.Orientation().RotationMatrix()
+		offset := pose.Point()
+		world := pointcloud.NewBasicPointCloud(points.Size())
+		var setErr error
+		points.Iterate(0, 0, func(p r3.Vector, d pointcloud.Data) bool {
+			setErr = world.Set(rot.Mul(p).Add(offset), d)
+			return setErr == nil
+		})
+		if setErr != nil {
+			return nil, setErr
+		}
+		return world, nil
+	}
+	return nil, errors.New("no point cloud in the detection")
 }
 
 // moveTCP plans and runs a move of the gripper TCP to a world pose, pointing
@@ -304,6 +321,7 @@ func (s *snackRestockerRestocker) runPick(ctx context.Context, cmd map[string]in
 	// Look at the bin from the first restock pose.
 	s.statusEvent("moving_to_view", "moving to "+pickViewSwitch, map[string]interface{}{
 		"target": nil, "attempts": 0, "last_refusal": nil, "snapshot_binary_data_id": nil, "snapshot_error": nil,
+		"pointcloud_binary_data_ids": nil, "pointcloud_error": nil,
 	})
 	if err := s.goToPose(ctx, pickViewSwitch, next(), &steps); err != nil {
 		return nil, err

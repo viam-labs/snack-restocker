@@ -39,7 +39,7 @@ These are optional. Without them the service still starts and `restock` works:
 |----------|------|---------|----------|
 | `drawer-open` | generic service (`viam-labs:restock-bot:fixture-teacher`) | `restock_fixture` | Opening the drawer with its taught `open` motion. |
 | `draw-closer` | generic service (`viam-labs:restock-bot:fixture-teacher`) | `restock_fixture` | Closing the drawer with its taught `close` motion. |
-| `sam3-vision` | vision service (`viam:sam3-detector:sam3-segments`) | `pick_snack` | Finding snack bags. Needs a version that supports the `get_object_point_clouds` DoCommand. |
+| `sam3-vision` | vision service (`viam:sam3-detector:sam3-segments`) | `pick_snack` | Finding snack bags. Needs a version that implements `GetDetections3D` (keeping the frame under `extra.snapshot_id`) and the `render_pick` DoCommand. |
 | `builtin` | motion service | `pick_snack` | Moving the gripper TCP to the bag. |
 | `gripper-tcp` | frame | `pick_snack` | The point the motion planner moves onto the bag. |
 
@@ -173,8 +173,8 @@ Grabs the snack bag SAM3 is most confident about, or the next most confident one
 The steps:
 
 1. Go to `restock-1-find` so the camera sees the bin.
-2. Ask `sam3-vision` for point clouds, which come back highest confidence first, and keep the ones that are plausible bags in the bin:
-   - its position is in the `world` frame,
+2. Ask `sam3-vision` for 3D detections (`GetDetections3D`), which come back highest confidence first. Each bag's center, size and top come from the bounds of its points in the `world` frame. Keep the ones that are plausible bags in the bin:
+   - its root frame is parented to `world`,
    - its center is inside the `bin` obstacle's footprint (centered at (250, -439), 555 × 355 mm) and between z = -50 and 450 mm,
    - its largest side is 40 to 400 mm.
 
@@ -241,6 +241,13 @@ On success:
 
 `pick_snack` is `"planned"` for a dry run and `"hovering"` for `hover_only`. If no bag or rotation can be reached, it returns `"pick_snack": "failed"` with an `error` and the full `attempts` list, and the gripper is left open at the last pose reached. If no bag is found, `sam3-vision` returns an error, or the gripper or lift fails, it returns `{"pick_snack": "failed", "error": "<reason>"}` and the arm is left where it stopped.
 
+After every run, `pick_snack` uploads to Viam data, as this service's `pick_snack` capture:
+
+- The pick image: the frame `sam3-vision` segmented, with every candidate labeled and the grabbed bag highlighted. Tags `pick_snack` and `pick_snack_<status>`.
+- The point cloud (`.pcd`, world frame, mm) of every bag the arm tried, except for `dry_run` and `hover_only`. Tags `pick_snack_cloud` and `pick_snack_cloud_<outcome>`, where the outcome is the pick status (`complete` or `error`) for the bag it reached and `unreachable` for a bag whose every hover or descend was refused. `complete` means the gripper closed and lifted; it does not check that the bag is held. The capture's method parameters carry `outcome`, `pick_status`, `snapshot_id`, `segment`, `label`, `confidence`, `center_mm`, `top_z_mm` and the image's `image_binary_data_id`; the file is named `<snapshot_id>_seg<segment>_<outcome>.pcd`.
+
+Upload problems never fail the pick; they are reported as `snapshot_error` and `pointcloud_error`, and the uploads as `snapshot_binary_data_id` and `pointcloud_binary_data_ids`.
+
 ### `pick_and_place`
 
 Runs `pick_snack` and then drops the bag over the drawer, twice by default:
@@ -286,7 +293,7 @@ Returns the live status of the current or last `pick_snack` / `pick_and_place` r
 }
 ```
 
-Phases, in order: `moving_to_view`, `segmenting`, `targets_found` (or `no_target`), then per try `hovering`, `descending`, `hover_refused` / `descend_refused`, `gripping`, `lifting`; for `pick_and_place` also `placing`, `dropping`, `round_complete` (with `round`, `rounds`, `rounds_completed`). The run ends in the command's final status (`complete`, `planned`, `hovering`, `failed`) with `running: false`, and the snapshot fields (`snapshot_binary_data_id` or `snapshot_error`) once uploaded. `events` keeps the last 50 phase changes. A new run replaces the previous one's status.
+Phases, in order: `moving_to_view`, `segmenting`, `targets_found` (or `no_target`), then per try `hovering`, `descending`, `hover_refused` / `descend_refused`, `gripping`, `lifting`; for `pick_and_place` also `placing`, `dropping`, `round_complete` (with `round`, `rounds`, `rounds_completed`). The run ends in the command's final status (`complete`, `planned`, `hovering`, `failed`) with `running: false`, and the upload fields (`snapshot_binary_data_id` or `snapshot_error`, `pointcloud_binary_data_ids` and `pointcloud_error`) once uploaded. `events` keeps the last 50 phase changes. A new run replaces the previous one's status.
 
 ### `pick-status` sensor
 
