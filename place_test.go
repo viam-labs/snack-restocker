@@ -26,7 +26,7 @@ func withPlacePoses(rig *pickRig) *pickRig {
 }
 
 func TestPickAndPlaceRunsTwoRounds(t *testing.T) {
-	rig := withPlacePoses(newPickRig(t, twoBags()))
+	rig := withPlacePoses(newPickRig(t, twoBags(t)))
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_and_place": true})
 	if resp["pick_and_place"] != "complete" || resp["rounds_completed"] != 2 {
 		t.Fatalf("pick_and_place: %v", resp)
@@ -50,7 +50,7 @@ func TestPickAndPlaceRunsTwoRounds(t *testing.T) {
 }
 
 func TestPickAndPlaceRounds(t *testing.T) {
-	rig := withPlacePoses(newPickRig(t, twoBags()))
+	rig := withPlacePoses(newPickRig(t, twoBags(t)))
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_and_place": true, "rounds": 3.0})
 	if resp["pick_and_place"] != "complete" || resp["rounds_completed"] != 3 || len(rig.visited) != 9 {
 		t.Fatalf("resp=%v visited=%v", resp, rig.visited)
@@ -58,7 +58,7 @@ func TestPickAndPlaceRounds(t *testing.T) {
 }
 
 func TestPickAndPlaceStopsWhenPickFails(t *testing.T) {
-	rig := withPlacePoses(newPickRig(t, twoBags()))
+	rig := withPlacePoses(newPickRig(t, twoBags(t)))
 	rig.refuse = func(_ r3.Vector, _ graspAngle) bool { return true }
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_and_place": true})
 	if resp["pick_and_place"] != "failed" || resp["rounds_completed"] != 0 || resp["error"] == nil {
@@ -70,7 +70,7 @@ func TestPickAndPlaceStopsWhenPickFails(t *testing.T) {
 }
 
 func TestPickAndPlaceDryRunDoesNotPlace(t *testing.T) {
-	rig := withPlacePoses(newPickRig(t, twoBags()))
+	rig := withPlacePoses(newPickRig(t, twoBags(t)))
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_and_place": true, "dry_run": true})
 	if resp["pick_and_place"] != "planned" || len(rig.moves) != 0 || len(rig.grips) != 0 {
 		t.Fatalf("resp=%v moves=%v grips=%v", resp, rig.moves, rig.grips)

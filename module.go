@@ -172,10 +172,10 @@ type snackRestockerRestocker struct {
 	vision vision.Service
 	motion motion.Service
 
-	// Per-pick snapshots; uploadSnapshot overrides the upload in tests.
-	uploadSnapshot snapshotUploader
-	viamClientMu   sync.Mutex
-	viamClient     *app.ViamClient
+	// Per-pick snapshots and point clouds; uploadData overrides the upload in tests.
+	uploadData   dataUploader
+	viamClientMu sync.Mutex
+	viamClient   *app.ViamClient
 
 	pickStatus pickStatus
 

@@ -4,6 +4,7 @@ go 1.26.10
 
 require (
 	github.com/golang/geo v0.0.0-20230421003525-6adc56603217
+	github.com/google/uuid v1.6.0
 	go.viam.com/rdk v1.14.2
 )
 
@@ -94,7 +95,6 @@ require (
 	github.com/google/flatbuffers v2.0.6+incompatible // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.14 // indirect
 	github.com/googleapis/gax-go/v2 v2.17.0 // indirect
 	github.com/gorilla/securecookie v1.1.2 // indirect

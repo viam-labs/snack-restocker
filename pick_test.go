@@ -10,10 +10,14 @@ import (
 	"github.com/golang/geo/r3"
 	toggleswitch "go.viam.com/rdk/components/switch"
 	"go.viam.com/rdk/logging"
+	"go.viam.com/rdk/pointcloud"
+	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/services/motion"
 	"go.viam.com/rdk/spatialmath"
 	"go.viam.com/rdk/testutils/inject"
 	injectmotion "go.viam.com/rdk/testutils/inject/motion"
+	"go.viam.com/rdk/vision/classification"
+	"go.viam.com/rdk/vision/detection3d"
 )
 
 type pickRig struct {
@@ -26,6 +30,11 @@ type pickRig struct {
 	visited   []string
 	// refuse, if set, makes the fake planner reject a move to p at angle.
 	refuse func(p r3.Vector, angle graspAngle) bool
+	// dets and detErr are what sam3-vision's GetDetections3D returns.
+	dets   []*detection3d.Detection
+	detErr error
+	// snapshotIDs are the snapshot IDs pick_snack asked sam3-vision to keep.
+	snapshotIDs []string
 }
 
 // angleOf returns which rotation, straight down or tilted, a tool orientation at p uses.
@@ -43,10 +52,10 @@ func angleOf(p r3.Vector, o spatialmath.Orientation) (graspAngle, bool) {
 
 // newPickRig fakes the switch, gripper, motion and sam3-vision resources and
 // records what pick_snack does with them.
-func newPickRig(t *testing.T, sam3Resp map[string]interface{}) *pickRig {
+func newPickRig(t *testing.T, dets []*detection3d.Detection) *pickRig {
 	stepDelay = 0
 	t.Cleanup(func() { stepDelay = time.Second })
-	rig := &pickRig{}
+	rig := &pickRig{dets: dets}
 
 	sw := inject.NewSwitch(pickViewSwitch)
 	sw.SetPositionFunc = func(ctx context.Context, position uint32, extra map[string]interface{}) error {
@@ -81,11 +90,14 @@ func newPickRig(t *testing.T, sam3Resp map[string]interface{}) *pickRig {
 		return true, nil
 	}
 	v := inject.NewVisionService(sam3VisionName)
+	v.GetDetections3DFunc = func(ctx context.Context, _ string, extra map[string]interface{}) ([]*detection3d.Detection, error) {
+		id, _ := extra["snapshot_id"].(string)
+		rig.snapshotIDs = append(rig.snapshotIDs, id)
+		return rig.dets, rig.detErr
+	}
+	// Pick tests do not check the per-pick records; snapshot_test.go does.
 	v.DoCommandFunc = func(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
-		if cmd["command"] != "get_object_point_clouds" {
-			t.Fatalf("unexpected sam3 command: %v", cmd)
-		}
-		return sam3Resp, nil
+		return map[string]interface{}{"error": "render_pick not faked"}, nil
 	}
 
 	rig.s = &snackRestockerRestocker{
@@ -96,31 +108,55 @@ func newPickRig(t *testing.T, sam3Resp map[string]interface{}) *pickRig {
 		motion:     m,
 		state:      initialState,
 		cancelFunc: func() {},
+		uploadData: func(context.Context, []byte, string, []string, map[string]interface{}) (string, error) {
+			return "binary", nil
+		},
 	}
 	return rig
 }
 
-// Two bags, best first, as the sam3-segments DoCommand returns them.
-func segment(conf float64, center, dims r3.Vector) map[string]interface{} {
-	return map[string]interface{}{
-		"label":           "snack bag",
-		"confidence":      conf,
-		"reference_frame": "world",
-		"center_mm":       vec(center),
-		"dims_mm":         vec(dims),
-		"max_mm":          vec(center.Add(dims.Mul(0.5))),
+// segmentIn is a SAM3 3D detection as the vision client returns it: a root
+// frame at center in frame, with a child cloud of the box's corners relative to it.
+func segmentIn(t *testing.T, frame string, conf float64, center, dims r3.Vector) *detection3d.Detection {
+	t.Helper()
+	pc := pointcloud.NewBasicPointCloud(8)
+	for _, sx := range []float64{-0.5, 0.5} {
+		for _, sy := range []float64{-0.5, 0.5} {
+			for _, sz := range []float64{-0.5, 0.5} {
+				corner := r3.Vector{X: sx * dims.X, Y: sy * dims.Y, Z: sz * dims.Z}
+				if err := pc.Set(corner, pointcloud.NewBasicData()); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+	octree, err := pointcloud.ToBasicOctree(pc, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &detection3d.Detection{
+		Transforms: []*referenceframe.LinkInFrame{
+			referenceframe.NewLinkInFrame(frame, spatialmath.NewPoseFromPoint(center), "seg/object", nil),
+			referenceframe.NewLinkInFrame("seg/object", spatialmath.NewZeroPose(), "seg/object/points", octree),
+		},
+		Classifications: classification.Classifications{classification.NewClassification(conf, "snack bag")},
 	}
 }
 
-func twoBags() map[string]interface{} {
-	bag := func(conf, x, topZ float64) map[string]interface{} {
-		return segment(conf, r3.Vector{X: x, Y: -440, Z: topZ - 30}, r3.Vector{X: 100, Y: 80, Z: 60})
+func segment(t *testing.T, conf float64, center, dims r3.Vector) *detection3d.Detection {
+	return segmentIn(t, referenceframe.World, conf, center, dims)
+}
+
+// Two bags, best first, as sam3-vision returns them.
+func twoBags(t *testing.T) []*detection3d.Detection {
+	bag := func(conf, x, topZ float64) *detection3d.Detection {
+		return segment(t, conf, r3.Vector{X: x, Y: -440, Z: topZ - 30}, r3.Vector{X: 100, Y: 80, Z: 60})
 	}
-	return map[string]interface{}{"objects": []interface{}{bag(0.9, 250, 100), bag(0.6, 150, 90)}}
+	return []*detection3d.Detection{bag(0.9, 250, 100), bag(0.6, 150, 90)}
 }
 
 func TestPickSnackDryRunOnlyGoesToViewPose(t *testing.T) {
-	rig := newPickRig(t, twoBags())
+	rig := newPickRig(t, twoBags(t))
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true, "dry_run": true})
 	if resp["pick_snack"] != "planned" {
 		t.Fatalf("dry run: %v", resp)
@@ -140,7 +176,7 @@ func TestPickSnackDryRunOnlyGoesToViewPose(t *testing.T) {
 }
 
 func TestPickSnackHoverOnly(t *testing.T) {
-	rig := newPickRig(t, twoBags())
+	rig := newPickRig(t, twoBags(t))
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{
 		"pick_snack": true, "hover_only": true, "approach_mm": 80.0,
 	})
@@ -156,7 +192,7 @@ func TestPickSnackHoverOnly(t *testing.T) {
 }
 
 func TestPickSnackFullGrab(t *testing.T) {
-	rig := newPickRig(t, twoBags())
+	rig := newPickRig(t, twoBags(t))
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
 	if resp["pick_snack"] != "complete" {
 		t.Fatalf("pick: %v", resp)
@@ -182,13 +218,21 @@ func TestPickSnackFullGrab(t *testing.T) {
 }
 
 func TestPickSnackErrors(t *testing.T) {
-	cases := map[string]map[string]interface{}{
-		"no bags":   {"objects": []interface{}{}},
-		"sam3 err":  {"error": "unknown command: get_object_point_clouds"},
-		"cam frame": {"objects": []interface{}{map[string]interface{}{"reference_frame": "cam"}}},
+	camFrame := segmentIn(t, "cam", 0.9, r3.Vector{X: 250, Y: -440, Z: 70}, r3.Vector{X: 100, Y: 80, Z: 60})
+	noPoints := segment(t, 0.9, r3.Vector{X: 250, Y: -440, Z: 70}, r3.Vector{X: 100, Y: 80, Z: 60})
+	noPoints.Transforms = noPoints.Transforms[:1]
+	cases := map[string]struct {
+		dets []*detection3d.Detection
+		err  error
+	}{
+		"no bags":   {},
+		"sam3 err":  {err: errors.New("ML model busy")},
+		"cam frame": {dets: []*detection3d.Detection{camFrame}},
+		"no points": {dets: []*detection3d.Detection{noPoints}},
 	}
-	for name, sam3Resp := range cases {
-		rig := newPickRig(t, sam3Resp)
+	for name, tc := range cases {
+		rig := newPickRig(t, tc.dets)
+		rig.detErr = tc.err
 		resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
 		if resp["pick_snack"] != "failed" || resp["error"] == nil {
 			t.Fatalf("%s: %v", name, resp)
@@ -210,13 +254,11 @@ func TestPickSnackWithoutServices(t *testing.T) {
 // Segments seen on munch-monitor: bag-sized clouds a meter outside the bin,
 // stretched clouds from far depth readings, and tiny fragments.
 func TestPickSnackSkipsImplausibleSegments(t *testing.T) {
-	outsideBin := segment(0.93, r3.Vector{X: 357, Y: -1539, Z: -887}, r3.Vector{X: 360, Y: 245, Z: 152})
-	stretched := segment(0.93, r3.Vector{X: 347, Y: -440, Z: 100}, r3.Vector{X: 388, Y: 300, Z: 1409})
-	fragment := segment(0.92, r3.Vector{X: 399, Y: -297, Z: 57}, r3.Vector{X: 6, Y: 7, Z: 4})
-	realBag := segment(0.90, r3.Vector{X: 121, Y: -419, Z: 181}, r3.Vector{X: 140, Y: 202, Z: 165})
-	rig := newPickRig(t, map[string]interface{}{
-		"objects": []interface{}{outsideBin, stretched, fragment, realBag},
-	})
+	outsideBin := segment(t, 0.93, r3.Vector{X: 357, Y: -1539, Z: -887}, r3.Vector{X: 360, Y: 245, Z: 152})
+	stretched := segment(t, 0.93, r3.Vector{X: 347, Y: -440, Z: 100}, r3.Vector{X: 388, Y: 300, Z: 1409})
+	fragment := segment(t, 0.92, r3.Vector{X: 399, Y: -297, Z: 57}, r3.Vector{X: 6, Y: 7, Z: 4})
+	realBag := segment(t, 0.90, r3.Vector{X: 121, Y: -419, Z: 181}, r3.Vector{X: 140, Y: 202, Z: 165})
+	rig := newPickRig(t, []*detection3d.Detection{outsideBin, stretched, fragment, realBag})
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true, "dry_run": true})
 	if resp["pick_snack"] != "planned" {
 		t.Fatalf("dry run: %v", resp)
@@ -230,8 +272,8 @@ func TestPickSnackSkipsImplausibleSegments(t *testing.T) {
 }
 
 func TestPickSnackFailsWhenNoSegmentIsPlausible(t *testing.T) {
-	outsideBin := segment(0.93, r3.Vector{X: 357, Y: -1539, Z: -887}, r3.Vector{X: 360, Y: 245, Z: 152})
-	rig := newPickRig(t, map[string]interface{}{"objects": []interface{}{outsideBin}})
+	outsideBin := segment(t, 0.93, r3.Vector{X: 357, Y: -1539, Z: -887}, r3.Vector{X: 360, Y: 245, Z: 152})
+	rig := newPickRig(t, []*detection3d.Detection{outsideBin})
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
 	if resp["pick_snack"] != "failed" || len(rig.moves) != 0 || len(rig.grips) != 0 {
 		t.Fatalf("should fail without moving toward the bag: %v moves=%v grips=%v", resp, rig.moves, rig.grips)
@@ -242,7 +284,7 @@ func TestPickSnackFailsWhenNoSegmentIsPlausible(t *testing.T) {
 // and z=90, so with the defaults the grab points are z=80 and z=70.
 
 func TestPickSnackRotatesWhenDescendIsRefused(t *testing.T) {
-	rig := newPickRig(t, twoBags())
+	rig := newPickRig(t, twoBags(t))
 	rig.refuse = func(p r3.Vector, a graspAngle) bool {
 		return p.Z == 80 && a.rotationDeg == 0 // bag 1's descend hits the wall unrotated
 	}
@@ -274,7 +316,7 @@ func TestPickSnackRotatesWhenDescendIsRefused(t *testing.T) {
 }
 
 func TestPickSnackMovesToNextBagWhenBothRotationsFail(t *testing.T) {
-	rig := newPickRig(t, twoBags())
+	rig := newPickRig(t, twoBags(t))
 	rig.refuse = func(p r3.Vector, a graspAngle) bool { return p.Z == 80 } // bag 1 unreachable
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
 	if resp["pick_snack"] != "complete" || resp["bag"] != 2 || resp["rotation_deg"] != 0.0 {
@@ -289,7 +331,7 @@ func TestPickSnackMovesToNextBagWhenBothRotationsFail(t *testing.T) {
 }
 
 func TestPickSnackReportsAttemptsWhenNothingIsReachable(t *testing.T) {
-	rig := newPickRig(t, twoBags())
+	rig := newPickRig(t, twoBags(t))
 	rig.refuse = func(p r3.Vector, a graspAngle) bool { return p.Z < 100 } // every descend
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
 	if resp["pick_snack"] != "failed" || resp["error"] == nil {
@@ -304,7 +346,7 @@ func TestPickSnackReportsAttemptsWhenNothingIsReachable(t *testing.T) {
 }
 
 func TestPickSnackMaxBags(t *testing.T) {
-	rig := newPickRig(t, twoBags())
+	rig := newPickRig(t, twoBags(t))
 	rig.refuse = func(p r3.Vector, a graspAngle) bool { return p.Z == 80 }
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true, "max_bags": 1.0})
 	if resp["pick_snack"] != "failed" || resp["plausible"] != 1 {
@@ -313,7 +355,7 @@ func TestPickSnackMaxBags(t *testing.T) {
 }
 
 func TestPickSnackHoverOnlyRotatesWhenHoverIsRefused(t *testing.T) {
-	rig := newPickRig(t, twoBags())
+	rig := newPickRig(t, twoBags(t))
 	rig.refuse = func(p r3.Vector, a graspAngle) bool { return a.rotationDeg == 0 }
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true, "hover_only": true})
 	if resp["pick_snack"] != "hovering" || resp["bag"] != 1 || resp["rotation_deg"] != 90.0 {
@@ -338,7 +380,7 @@ func TestHoverHeightIsCappedNearTheRim(t *testing.T) {
 func isHover(p r3.Vector) bool { return p.Z > 200 }
 
 func TestPickSnackTiltsTheHoverOnlyAfterEveryRotationStraightDown(t *testing.T) {
-	rig := newPickRig(t, twoBags())
+	rig := newPickRig(t, twoBags(t))
 	rig.refuse = func(p r3.Vector, a graspAngle) bool { return isHover(p) && a.tiltDeg == 0 }
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
 	if resp["pick_snack"] != "complete" || resp["bag"] != 1 || resp["rotation_deg"] != 0.0 ||
@@ -358,7 +400,7 @@ func TestPickSnackTiltsTheHoverOnlyAfterEveryRotationStraightDown(t *testing.T) 
 }
 
 func TestPickSnackDoesNotTiltAfterARefusedDescend(t *testing.T) {
-	rig := newPickRig(t, twoBags())
+	rig := newPickRig(t, twoBags(t))
 	rig.refuse = func(p r3.Vector, a graspAngle) bool { return p.Z == 80 } // bag 1's descend, every rotation
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
 	if resp["pick_snack"] != "complete" || resp["bag"] != 2 {
@@ -377,7 +419,7 @@ func TestPickSnackDoesNotTiltAfterARefusedDescend(t *testing.T) {
 }
 
 func TestPickSnackTriesTiltedHoversBeforeTheNextBag(t *testing.T) {
-	rig := newPickRig(t, twoBags())
+	rig := newPickRig(t, twoBags(t))
 	rig.refuse = func(p r3.Vector, a graspAngle) bool { return math.Abs(p.Z-220) < 1 } // bag 1's hover, every angle
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true})
 	if resp["pick_snack"] != "complete" || resp["bag"] != 2 || resp["tilt_deg"] != 0.0 {
@@ -412,7 +454,7 @@ func TestToolOrientationLeansWristTowardBinCenter(t *testing.T) {
 
 func TestPickSnackUsesConfiguredGraspDepth(t *testing.T) {
 	depth := 35.0
-	rig := newPickRig(t, twoBags())
+	rig := newPickRig(t, twoBags(t))
 	rig.s.cfg.GraspDepthMm = &depth
 	resp, _ := rig.s.DoCommand(context.Background(), map[string]interface{}{"pick_snack": true, "dry_run": true})
 	if grasp := resp["grasp_mm"].(map[string]interface{}); grasp["z"] != 100-depth {
