@@ -25,6 +25,10 @@ const (
 	closeMotion = "close"
 )
 
+// Joint speed for the drawer motions. The taught open and close motions run
+// smoothly at half the arm's default speed.
+const fixtureSpeedDegsPerSec = 30.0
+
 // runFixtureMotion replays a taught motion on a fixture-teacher service. The
 // service reports failures in an "error" field rather than an RPC error.
 func (s *snackRestockerRestocker) runFixtureMotion(
@@ -35,7 +39,9 @@ func (s *snackRestockerRestocker) runFixtureMotion(
 		return fmt.Errorf("'%s' fixture service is not available on the machine", svcName)
 	}
 	s.logger.Infof("fixture restock step %d [%s]: %s run motion '%s'", step, state, svcName, motionName)
-	resp, err := svc.DoCommand(ctx, map[string]interface{}{"cmd": "run", "motion": motionName})
+	resp, err := svc.DoCommand(ctx, map[string]interface{}{
+		"cmd": "run", "motion": motionName, "speed_degs_per_sec": fixtureSpeedDegsPerSec,
+	})
 	if err != nil {
 		return fmt.Errorf("%s run %s: %w", svcName, motionName, err)
 	}
